@@ -1,6 +1,7 @@
 """Fill a closed shell mesh with a lattice and mesh the result."""
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields as dc_fields
+import json
 import time
 
 import numpy as np
@@ -9,30 +10,94 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from skimage.measure import marching_cubes
 
-from . import fields
+from . import expr, fields, maps
 from .sdf import make_grid, mesh_sdf
+from .surfaces import SURFACES, default_center, surface_distances
 
 
 @dataclass
 class LatticeSpec:
-    lattice: str = "gyroid"  # gyroid | diamond | schwarz_p | bcc
+    """Everything that defines a lattice part. Saved and loaded as a JSON recipe."""
+
+    lattice: str = "gyroid"  # see fields.lattice_kinds()
     cell: float = 10.0  # unit cell size, mm
+    graph: list = None  # strut segments in unit-cell coords, for lattice="custom"
+    cell_map: str = "rectangular"  # rectangular | cylindrical | spherical | conformal
+    center: list = None  # helmet centre for curved maps and surfaces (default: rim centre)
+    pole: str = None  # spherical: pole axis (default x, poles at the ears); conformal: crown axis (default z)
+    layers: int = None  # cells through the shell for the conformal map (default: auto)
     wall_min: float = 0.8  # wall / strut thickness where grading = 0, mm
     wall_max: float = 0.8  # wall / strut thickness where grading = 1, mm
-    grading: str = "uniform"  # uniform | z | depth | point
-    grade_point: tuple = (0.0, 0.0, 0.0)  # used by grading="point"
+    grading: str = "uniform"  # uniform | z | depth | point | expr
+    grade_point: list = field(default_factory=lambda: [0.0, 0.0, 0.0])  # used by grading="point"
     grade_depth: float = 10.0  # used by grading="depth", mm
-    skin: float = 1.2  # solid skin on every surface of the part, mm (0 = none)
+    grade_expr: str = None  # used by grading="expr"; result is clipped to [0, 1]
+    skin: float = 1.2  # solid skin thickness, mm (0 = none)
+    skin_surfaces: list = field(default_factory=lambda: ["all"])  # "all" or any of outer, inner, rim
+    holes: list = field(default_factory=list)  # drain holes through the skin, each [x, y, z, radius] in mm
     fillet: float = 0.5  # blend radius between lattice and skin, mm
     pitch: float = 0.5  # voxel size, mm
     slab: int = 64  # z-slices meshed per chunk
     decimate: float = 0.0  # fraction of triangles to remove (0 = keep all)
-    log: callable = field(default=print, repr=False)
+    log: callable = field(default=print, repr=False, compare=False)
+
+    def to_json(self):
+        d = asdict(self)
+        d.pop("log")
+        return json.dumps(d, indent=2)
+
+    @classmethod
+    def from_dict(cls, d, **extra):
+        known = {f.name for f in dc_fields(cls)} - {"log"}
+        unknown = set(d) - known
+        if unknown:
+            raise ValueError(f"unknown recipe keys: {sorted(unknown)}")
+        return cls(**d, **extra)
+
+
+def _grading(spec, x, y, z, s, aux, bounds):
+    """Scalar field in [0, 1] that drives wall thickness."""
+    lo, hi = bounds
+    if spec.grading == "uniform":
+        return np.float32(0)
+    if spec.grading == "z":
+        return np.clip((z - lo[2]) / max(hi[2] - lo[2], 1e-6), 0, 1)
+    if spec.grading == "depth":
+        return np.clip(-s / spec.grade_depth, 0, 1)
+    if spec.grading == "point":
+        p = np.asarray(spec.grade_point, dtype=np.float32)
+        d = np.sqrt((x - p[0]) ** 2 + (y - p[1]) ** 2 + (z - p[2]) ** 2)
+        far = np.max(np.linalg.norm(np.array([lo, hi]) - p, axis=1))
+        return np.clip(d / max(far, 1e-6), 0, 1)
+    if spec.grading == "expr":
+        c = aux["center"]
+        env = {
+            "x": x, "y": y, "z": z, "depth": -s,
+            "r": np.sqrt((x - c[0]) ** 2 + (y - c[1]) ** 2 + (z - c[2]) ** 2),
+        }
+        if aux.get("shell_t") is not None:
+            env["shell"] = aux["shell_t"]
+        return np.clip(np.asarray(expr.evaluate(aux["expr"], env), dtype=np.float32), 0, 1)
+    raise ValueError(f"unknown grading {spec.grading!r}")
+
+
+def _validate(spec):
+    if spec.lattice not in fields.lattice_kinds():
+        raise ValueError(f"lattice must be one of {fields.lattice_kinds()}")
+    if spec.cell_map not in maps.MAPS:
+        raise ValueError(f"cell_map must be one of {maps.MAPS}")
+    surf = set(spec.skin_surfaces)
+    if surf != {"all"} and not surf <= set(SURFACES):
+        raise ValueError(f"skin_surfaces must be 'all' or a subset of {SURFACES}")
+    if spec.grading == "expr":
+        if not spec.grade_expr:
+            raise ValueError("grading 'expr' needs grade_expr")
+        return expr.compile_expr(spec.grade_expr)
+    return None
 
 
 def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
-    if spec.lattice not in fields.LATTICES:
-        raise ValueError(f"lattice must be one of {sorted(fields.LATTICES)}")
+    compiled = _validate(spec)
     if not shell.is_watertight:
         spec.log("warning: input mesh is not watertight; inside test may leak")
 
@@ -43,31 +108,86 @@ def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
     sdf = mesh_sdf(shell, grid)
     spec.log(f"shell SDF done in {time.time() - t0:.1f}s")
 
-    lattice_fn = fields.LATTICES[spec.lattice]
+    center = np.asarray(spec.center if spec.center is not None else default_center(shell), dtype=np.float32)
+    aux = {"center": center, "expr": compiled, "shell_t": None}
+    surf = None
+    need_shell_t = spec.cell_map == "conformal" or (compiled is not None and "shell" in expr.names_used(compiled))
+    if need_shell_t or set(spec.skin_surfaces) != {"all"}:
+        surf = surface_distances(shell, grid, center)
+        spec.log("surfaces: " + ", ".join(f"{k}={'yes' if v is not None else 'none'}" for k, v in surf.items()))
+    layers = spec.layers
+    if need_shell_t:
+        d_o, d_i = surf["outer"], surf["inner"]
+        if d_o is None or d_i is None:
+            raise ValueError("conformal map needs both outer and inner surfaces; check `center`")
+        aux["shell_t"] = np.clip(d_o / np.maximum(d_o + d_i, 1e-6), 0, 1)
+        if layers is None:
+            thick = (d_o + d_i)[sdf < 0]
+            layers = max(1, int(round(float(np.median(thick)) / spec.cell)))
+        spec.log(f"conformal: {layers} cell layer(s) through the shell")
+    ref_radius = float(np.median(np.linalg.norm(shell.vertices - center, axis=1)))
+
     bounds = shell.bounds.astype(np.float32)
     nz = grid.shape[2]
     pieces = []
+    seam = None
     for k0 in range(0, nz - 1, spec.slab):
         k1 = min(k0 + spec.slab + 1, nz)  # one slice of overlap so chunks stitch
         s = sdf[:, :, k0:k1]
+        if s.min() > spec.fillet:  # slab entirely outside the part
+            continue
+
+        # Lattice on the slab plus a one-slice halo, so the gradient is centred.
+        h0, h1 = max(k0 - 1, 0), min(k1 + 1, nz)
+        hx, hy, hz = grid.coords(h0, h1)
+        shell_t = None if aux["shell_t"] is None else aux["shell_t"][:, :, h0:h1]
+        u, v, w = maps.map_coords(spec.cell_map, hx, hy, hz, spec.cell, center, ref_radius,
+                                  pole=spec.pole, shell_t=shell_t, layers=layers or 1)
+        R, mode = fields.raw_field(spec.lattice, u, v, w, spec.cell, spec.graph)
+        del u, v, w
+        gx, gy, gz = np.gradient(R, spec.pitch)
+        crop = slice(k0 - h0, k0 - h0 + (k1 - k0))
+        grad = np.sqrt(gx * gx + gy * gy + gz * gz)[:, :, crop]
+        R = R[:, :, crop]
+        del gx, gy, gz
+
         x, y, z = grid.coords(k0, k1)
-        t = fields.grading(
-            spec.grading, x, y, z, s, bounds,
-            point=spec.grade_point, depth_range=spec.grade_depth,
-        )
+        slab_aux = dict(aux, shell_t=None if aux["shell_t"] is None else aux["shell_t"][:, :, k0:k1])
+        t = _grading(spec, x, y, z, s, slab_aux, bounds)
         wall = spec.wall_min + (spec.wall_max - spec.wall_min) * t
-        lat = lattice_fn(x, y, z, spec.cell, wall)
+        lat = fields.to_distance(R, grad, mode, wall, spec.cell)
+        del R, grad
+
         if spec.skin > 0:
-            body = fields.smooth_min(-s - spec.skin, lat, spec.fillet)
+            if set(spec.skin_surfaces) == {"all"}:
+                skin = -s - spec.skin
+            else:
+                near = [surf[n][:, :, k0:k1] for n in spec.skin_surfaces if surf[n] is not None]
+                skin = np.minimum.reduce(near) - spec.skin if near else np.full_like(s, np.inf)
+            for hx_, hy_, hz_, hr in spec.holes:
+                skin = np.maximum(skin, hr - np.sqrt((x - hx_) ** 2 + (y - hy_) ** 2 + (z - hz_) ** 2))
+            body = fields.smooth_min(skin, lat, spec.fillet)
         else:
             body = lat
         f = np.maximum(s, body)  # keep everything inside the shell
+        # Reuse the previous chunk's last slice so the shared plane is
+        # bit-identical; recomputing it can differ in the last ulp and tear
+        # the seam.
+        if seam is not None and seam[0] == k0:
+            f[:, :, 0] = seam[1]
+        # Push near-zero samples off the surface. A sample sitting on the
+        # iso-level makes all its edge vertices coincide, and merging them
+        # pinches the surface into a non-manifold edge.
+        f[np.abs(f) < 1e-4] = np.float32(1e-4)
+        seam = (k1 - 1, f[:, :, -1].copy())
         if f.min() >= 0 or f.max() <= 0:
             continue
-        v, faces, _, _ = marching_cubes(f, level=0.0, spacing=(spec.pitch,) * 3)
-        v += grid.origin + np.array([0, 0, k0 * spec.pitch])
-        pieces.append((v, faces))
+        vtx, faces, _, _ = marching_cubes(f, level=0.0, spacing=(spec.pitch,) * 3)
+        vtx += grid.origin + np.array([0, 0, k0 * spec.pitch])
+        pieces.append((vtx, faces))
     spec.log(f"meshed {len(pieces)} chunks in {time.time() - t0:.1f}s")
+    if not pieces:
+        raise ValueError("the lattice came out empty; check cell size and wall thickness")
 
     verts, faces, offset = [], [], 0
     for v, fc in pieces:
@@ -76,7 +196,10 @@ def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
         offset += len(v)
     out = trimesh.Trimesh(np.vstack(verts), np.vstack(faces), process=False)
     out.merge_vertices(digits_vertex=6)
-    out.update_faces(out.nondegenerate_faces())
+    # Drop only faces that collapsed onto a repeated vertex. Removing every
+    # zero-area face would also drop slivers whose edges other faces rely on.
+    f = out.faces
+    out.update_faces((f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 2] != f[:, 0]))
     out.remove_unreferenced_vertices()
     if spec.decimate > 0:
         import fast_simplification

@@ -1,8 +1,10 @@
 # lattice-helmet
 
-Phase 1 of an nTop-style lattice tool for Onshape: an implicit (signed distance
-field) engine that fills a closed helmet shell with a lattice and writes a
-printable 3MF/STL. The Onshape app will wrap this later.
+An nTop-style lattice engine for helmets, to be wrapped by an Onshape app. It
+fills a closed helmet shell with a field-driven lattice (signed distance
+fields throughout) and writes a printable 3MF/STL. Phase 2 adds conformal
+cell maps, more unit cells, expression fields, per-surface skins, drain holes
+and JSON recipes.
 
 ## Install
 
@@ -21,18 +23,34 @@ python -m lattice_helmet.cli out/test_helmet.stl out/helmet.3mf \
 python examples/preview.py out/helmet.3mf out/helmet_sections.png
 ```
 
+Or from a recipe (any option on the command line overrides it):
+
+```
+python -m lattice_helmet.cli out/test_helmet.stl out/helmet.3mf --recipe recipes/conformal_gyroid_crown.json
+```
+
 Input is any watertight mesh in mm, e.g. a helmet liner exported from Onshape as STL.
+The helmet is assumed to sit crown up (+z) with the rim at its lowest point; pass
+`--center` if the head centre is elsewhere.
 
 | option | meaning |
 |---|---|
-| `--lattice` | `gyroid`, `diamond`, `schwarz_p` (sheet TPMS) or `bcc` (struts) |
+| `--lattice` | sheet TPMS `gyroid`, `diamond`, `schwarz_p`, `neovius`; solid TPMS `<name>_network`; struts `sc`, `bcc`, `fcc`, `octet`; `custom` with `--graph segments.json` |
 | `--cell` | unit cell size, mm |
-| `--wall`, `--wall-max` | wall/strut thickness where the grading field is 0 and 1 |
-| `--grading` | `uniform`, `z` (bottom to top), `depth` (surface to core, `--grade-depth` mm), `point` (distance from `--grade-point`, e.g. a crown impact zone) |
-| `--skin` | solid skin on every surface, mm (0 = open lattice) |
+| `--cell-map` | `rectangular`, `cylindrical`, `spherical`, `conformal` (layers follow the shell, a whole number of cells through its thickness; `--layers` to force) |
+| `--wall`, `--wall-max` | wall/strut thickness where the grading field is 0 and 1. For `_network` lattices it is the offset from the minimal surface (0 = 50% solid) |
+| `--grading` | `uniform`, `z`, `depth`, `point`, or `expr` with `--grade-expr` |
+| `--grade-expr` | expression giving 0 to 1. Variables `x y z` (mm), `depth` (mm from the nearest surface), `r` (mm from the centre), `shell` (0 outer to 1 inner). Functions `smoothstep lerp clip min max abs sqrt exp log sin cos tan atan2 dist where` |
+| `--skin` | solid skin thickness, mm (0 = open lattice) |
+| `--skin-surfaces` | `all`, or any of `outer inner rim`. Leaving the rim open lets the lattice drain |
+| `--hole X Y Z R` | drain hole through the skin; repeatable |
 | `--fillet` | blend radius where lattice meets skin, mm |
-| `--pitch` | voxel size, mm. Keep it at or below half the wall thickness |
+| `--pitch` | voxel size, mm. Keep it at or below half the sheet wall, a quarter of the strut diameter |
 | `--decimate` | fraction of triangles to remove after meshing |
+| `--recipe`, `--save-recipe` | load / write the full spec as JSON |
+
+`custom` graphs are a JSON list of `[[x0, y0, z0], [x1, y1, z1]]` segments in
+unit-cell coordinates (0 to 1).
 
 The run prints a JSON report: triangle count, watertightness, number of surface
 shells, volumes and relative density.
@@ -41,22 +59,31 @@ shells, volumes and relative density.
 
 1. `sdf.py` voxelises the shell with one parity ray per column, then builds a
    signed distance field from two Euclidean distance transforms.
-2. `fields.py` evaluates the lattice as a distance field: TPMS use
-   `|f| / |grad f|` with analytic gradients so wall thickness is in mm, struts
-   use exact distance to the cell diagonals. A grading field in [0, 1]
-   interpolates the thickness.
-3. `build.py` combines them as `max(shell, smooth_min(skin, lattice))` and runs
+2. `maps.py` turns world coordinates into lattice coordinates. The conformal
+   map uses position through the shell (from distances to the outer and inner
+   surfaces, `surfaces.py`) as one axis and an azimuthal equidistant projection
+   around the crown for the other two.
+3. `fields.py` evaluates the unit cell there. `build.py` converts it to a
+   world-space distance with `R / |grad R|` (numerical gradient), so walls stay
+   in mm under any map. Grading fields, including safe expressions
+   (`expr.py`), interpolate the thickness.
+4. `build.py` combines them as `max(shell, smooth_min(skin, lattice))` and runs
    marching cubes in z-slabs that overlap by one slice so they stitch exactly.
 
 ## Known limits
 
 - The shell SDF is accurate to about half a voxel at the surface; the lattice
   itself is analytic and smooth.
-- Sheet TPMS walls come out about 5% thinner than requested (first-order
-  distance estimate); BCC nodes are slightly under-filled.
-- A fully skinned sheet TPMS seals its two labyrinths as internal voids
-  (`surface_shells` > 1). Fine for FDM; resin and powder printing need drain
-  holes, which are on the roadmap.
+- Sheet TPMS walls are calibrated to within about 2% of the requested
+  thickness. Struts come out up to 15% under volume when the diameter is only
+  4 voxels; use a finer pitch for thin struts.
+- The conformal map compresses cells around the circumference toward the rim
+  (about 0.64x at the equator), because it flattens the dome from the crown.
+- With `--skin-surfaces all`, a sheet TPMS seals its two labyrinths as
+  internal voids (`surface_shells` > 1). Fine for FDM; for resin or powder,
+  leave the rim open or add `--hole`s.
+- Strut lattices are slower than TPMS (octet: about 8 minutes at 0.5 mm on
+  4 cores); GPU evaluation is on the roadmap.
 - `--decimate` can leave a few non-manifold edges where thin walls touch. The
   report flags it; slicers usually repair it.
 - A 0.5 mm run on a full helmet is about 60 M voxels, 4 minutes and 11 M

@@ -1,4 +1,7 @@
-"""Command line: lattice-helmet shell.stl out.3mf [options]"""
+"""Command line: lattice-helmet shell.stl out.3mf [options]
+
+Options override values from --recipe; --save-recipe writes the final spec.
+"""
 
 import argparse
 import json
@@ -6,32 +9,62 @@ import json
 import trimesh
 
 from .build import LatticeSpec, build, report
+from .fields import lattice_kinds
+from .maps import MAPS
+
+
+def _parser():
+    ap = argparse.ArgumentParser(description="Fill a closed shell mesh with a lattice.")
+    ap.add_argument("input", help="closed shell mesh (STL/OBJ/3MF), mm")
+    ap.add_argument("output", nargs="?", help="output mesh, .3mf or .stl")
+    ap.add_argument("--recipe", help="JSON recipe to start from")
+    ap.add_argument("--save-recipe", help="write the final recipe to this JSON file")
+    o = ap.add_argument_group("lattice (each overrides the recipe)")
+    o.add_argument("--lattice", choices=lattice_kinds())
+    o.add_argument("--graph", help="JSON file of strut segments for --lattice custom")
+    o.add_argument("--cell", type=float, help="unit cell size, mm")
+    o.add_argument("--cell-map", choices=MAPS)
+    o.add_argument("--center", type=float, nargs=3, metavar=("X", "Y", "Z"), help="helmet centre")
+    o.add_argument("--pole", choices=["x", "y", "z"], help="pole axis for spherical/conformal maps")
+    o.add_argument("--layers", type=int, help="cells through the shell (conformal)")
+    o.add_argument("--wall", dest="wall_min", type=float, help="wall/strut thickness, mm")
+    o.add_argument("--wall-max", type=float, help="thickness where grading = 1 (default: --wall)")
+    o.add_argument("--grading", choices=["uniform", "z", "depth", "point", "expr"])
+    o.add_argument("--grade-point", type=float, nargs=3, metavar=("X", "Y", "Z"))
+    o.add_argument("--grade-depth", type=float, help="mm, for --grading depth")
+    o.add_argument("--grade-expr", help="expression giving 0..1, e.g. 'smoothstep(60, 0, dist(x,y,z,0,0,125))'")
+    o.add_argument("--skin", type=float, help="solid skin thickness, mm (0 = none)")
+    o.add_argument("--skin-surfaces", nargs="+", choices=["all", "outer", "inner", "rim"])
+    o.add_argument("--hole", dest="holes", type=float, nargs=4, action="append",
+                   metavar=("X", "Y", "Z", "R"), help="drain hole through the skin (repeatable)")
+    o.add_argument("--fillet", type=float, help="lattice-to-skin blend radius, mm")
+    o.add_argument("--pitch", type=float, help="voxel size, mm (smaller = finer, slower)")
+    o.add_argument("--decimate", type=float, help="fraction of triangles to remove, e.g. 0.7")
+    return ap
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Fill a closed shell mesh with a lattice.")
-    ap.add_argument("input", help="closed shell mesh (STL/OBJ/3MF), mm")
-    ap.add_argument("output", help="output mesh, .3mf or .stl")
-    ap.add_argument("--lattice", default="gyroid", choices=["gyroid", "diamond", "schwarz_p", "bcc"])
-    ap.add_argument("--cell", type=float, default=10.0, help="unit cell size, mm")
-    ap.add_argument("--wall", type=float, default=0.8, help="wall/strut thickness, mm")
-    ap.add_argument("--wall-max", type=float, help="thickness where grading = 1 (default: --wall)")
-    ap.add_argument("--grading", default="uniform", choices=["uniform", "z", "depth", "point"])
-    ap.add_argument("--grade-point", type=float, nargs=3, default=(0, 0, 0), metavar=("X", "Y", "Z"))
-    ap.add_argument("--grade-depth", type=float, default=10.0, help="mm, for --grading depth")
-    ap.add_argument("--skin", type=float, default=1.2, help="solid skin thickness, mm (0 = none)")
-    ap.add_argument("--fillet", type=float, default=0.5, help="lattice-to-skin blend radius, mm")
-    ap.add_argument("--pitch", type=float, default=0.5, help="voxel size, mm (smaller = finer, slower)")
-    ap.add_argument("--decimate", type=float, default=0.0, help="fraction of triangles to remove, e.g. 0.7")
-    a = ap.parse_args(argv)
+    a = _parser().parse_args(argv)
+    spec = {}
+    if a.recipe:
+        with open(a.recipe) as f:
+            spec = json.load(f)
+    overrides = {k: v for k, v in vars(a).items()
+                 if v is not None and k not in ("input", "output", "recipe", "save_recipe", "graph")}
+    if a.graph:
+        with open(a.graph) as f:
+            overrides["graph"] = json.load(f)
+    if "wall_min" in overrides and "wall_max" not in overrides and "wall_max" not in spec:
+        overrides["wall_max"] = overrides["wall_min"]
+    spec.update(overrides)
+    spec = LatticeSpec.from_dict(spec)
 
+    if a.save_recipe:
+        with open(a.save_recipe, "w") as f:
+            f.write(spec.to_json())
+    if not a.output:
+        return
     shell = trimesh.load_mesh(a.input)
-    spec = LatticeSpec(
-        lattice=a.lattice, cell=a.cell,
-        wall_min=a.wall, wall_max=a.wall if a.wall_max is None else a.wall_max,
-        grading=a.grading, grade_point=tuple(a.grade_point), grade_depth=a.grade_depth,
-        skin=a.skin, fillet=a.fillet, pitch=a.pitch, decimate=a.decimate,
-    )
     part = build(shell, spec)
     part.export(a.output)
     print(json.dumps(report(shell, part), indent=2))
