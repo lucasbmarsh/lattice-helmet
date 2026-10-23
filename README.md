@@ -88,3 +88,41 @@ shells, volumes and relative density.
   report flags it; slicers usually repair it.
 - A 0.5 mm run on a full helmet is about 60 M voxels, 4 minutes and 11 M
   triangles on 4 CPU cores. GPU evaluation is on the roadmap.
+
+## Onshape app (Phase 3, in progress)
+
+`app/` is the compute service and the panel that Onshape shows beside a Part
+Studio.
+
+```
+pip install -e .[app]
+export ONSHAPE_ACCESS_KEY=...  ONSHAPE_SECRET_KEY=...   # Developer Portal > API keys
+uvicorn app.main:app --port 8000
+```
+
+Open http://localhost:8000/panel/ to use it with an uploaded mesh. Inside
+Onshape the panel lists the Part Studio's parts, exports the chosen one as
+STL, builds the lattice, and offers the 3MF for download or imports it back
+into the document.
+
+| endpoint | does |
+|---|---|
+| `GET /api/options` | lattice types, cell maps and the default recipe |
+| `GET /api/parts?did&wvm&wvmid&eid` | parts in a Part Studio |
+| `POST /api/jobs/onshape` | export a part from Onshape and start a build |
+| `POST /api/jobs/upload` | start a build from an uploaded mesh |
+| `GET /api/jobs/{id}` | status, log and report |
+| `GET /api/jobs/{id}/result.3mf` | the printable result |
+| `POST /api/jobs/{id}/import` | add the result to the source document |
+
+To show the panel inside Onshape, the service needs a public HTTPS URL. Then,
+in the Onshape Developer Portal, create an OAuth application and add a
+right-panel extension in the Part Studio context whose action URL is
+
+```
+https://<your host>/panel/?documentId={$documentId}&workspaceId={$workspaceId}&elementId={$elementId}
+```
+
+The Onshape endpoint paths in `app/onshape.py` have not been run against
+cad.onshape.com yet; the tests use a fake Onshape client. Jobs run one at a
+time in-process, which suits a single user.

@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lattice helmet</title>
+<style>
+  :root { --bg: #fff; --fg: #1d1d1f; --muted: #6b6b70; --line: #d8d8dc; --accent: #2f6fde; --bad: #c0392b; --ok: #2e8b57; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1e1e20; --fg: #ececf0; --muted: #a0a0a8; --line: #3a3a3f; --accent: #6c9cff; --bad: #ff7b6b; --ok: #5fd08d; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px; font: 13px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 10px; padding: 8px 10px; }
+  legend { color: var(--muted); padding: 0 4px; }
+  label { display: grid; grid-template-columns: 110px 1fr; align-items: center; gap: 6px; margin: 4px 0; }
+  input, select, textarea, button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; width: 100%; }
+  .row { display: flex; gap: 6px; } .row > * { flex: 1; }
+  .checks { display: flex; gap: 10px; flex-wrap: wrap; } .checks label { display: flex; gap: 4px; margin: 0; } .checks input { width: auto; }
+  button { background: var(--accent); color: #fff; border: 0; padding: 7px; cursor: pointer; }
+  button.secondary { background: none; color: var(--accent); border: 1px solid var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin-top: 8px; white-space: pre-wrap; color: var(--muted); max-height: 160px; overflow: auto; }
+  .bad { color: var(--bad) !important; } .ok { color: var(--ok) !important; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<h1>Lattice helmet</h1>
+
+<fieldset id="source">
+  <legend>Shell</legend>
+  <label id="part-row">Part <select id="part"></select></label>
+  <label id="file-row" class="hidden">Mesh file <input id="file" type="file" accept=".stl,.obj,.3mf"></label>
+</fieldset>
+
+<fieldset>
+  <legend>Lattice</legend>
+  <label>Type <select id="lattice"></select></label>
+  <label>Cell map <select id="cell_map"></select></label>
+  <label>Cell size, mm <input id="cell" type="number" step="0.5" min="2"></label>
+  <label>Wall, mm <span class="row"><input id="wall_min" type="number" step="0.1" min="0" title="where grading = 0"><input id="wall_max" type="number" step="0.1" min="0" title="where grading = 1"></span></label>
+  <label>Grading <select id="grading"></select></label>
+  <label id="expr-row" class="hidden">Expression <input id="grade_expr" placeholder="smoothstep(0, 90, dist(x, y, z, 0, 0, 125))"></label>
+</fieldset>
+
+<fieldset>
+  <legend>Skin and output</legend>
+  <label>Skin, mm <input id="skin" type="number" step="0.1" min="0"></label>
+  <div class="checks" id="skin_surfaces"></div>
+  <label>Resolution, mm <input id="pitch" type="number" step="0.1" min="0.2"></label>
+</fieldset>
+
+<button id="run">Generate lattice</button>
+<div class="row" style="margin-top:6px">
+  <button id="download" class="secondary" disabled>Download 3MF</button>
+  <button id="import" class="secondary hidden" disabled>Import into Onshape</button>
+</div>
+<div id="status"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const q = new URLSearchParams(location.search);
+// Onshape fills these from the extension URL template.
+const doc = {
+  did: q.get("documentId"),
+  wvm: q.get("wvm") || (q.get("workspaceId") ? "w" : "v"),
+  wvmid: q.get("workspaceId") || q.get("versionId") || q.get("wvmid"),
+  eid: q.get("elementId"),
+};
+const inOnshape = !!(doc.did && doc.wvmid && doc.eid);
+let jobId = null;
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
+function say(text, cls) { const s = $("status"); s.textContent = text; s.className = cls || ""; }
+function fill(sel, items, value) { $(sel).innerHTML = items.map(v => `<option>${v}</option>`).join(""); if (value != null) $(sel).value = value; }
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  return r.json();
+}
+
+async function init() {
+  const o = await api("/api/options"), d = o.defaults;
+  fill("lattice", o.lattices, d.lattice); fill("cell_map", o.cell_maps, "conformal");
+  fill("grading", o.gradings, d.grading);
+  for (const k of ["cell", "wall_min", "wall_max", "skin", "pitch"]) $(k).value = d[k];
+  $("skin_surfaces").innerHTML = o.skin_surfaces.map(s =>
+    `<label><input type="checkbox" value="${s}" ${s === "all" ? "checked" : ""}>${s}</label>`).join("");
+  $("grading").onchange = () => $("expr-row").classList.toggle("hidden", $("grading").value !== "expr");
+
+  if (inOnshape) {
+    $("import").classList.remove("hidden");
+    try {
+      const parts = await api(`/api/parts?did=${doc.did}&wvm=${doc.wvm}&wvmid=${doc.wvmid}&eid=${doc.eid}`);
+      $("part").innerHTML = parts.map(p => `<option value="${esc(p.partId)}">${esc(p.name)}</option>`).join("");
+      if (!parts.length) say("This Part Studio has no parts.", "bad");
+    } catch (e) { say("Could not list parts: " + e.message, "bad"); }
+  } else {
+    $("part-row").classList.add("hidden"); $("file-row").classList.remove("hidden");
+    say("Not opened from Onshape: upload a shell mesh instead.");
+  }
+}
+
+function recipe() {
+  const num = k => parseFloat($(k).value);
+  const surfaces = [...$("skin_surfaces").querySelectorAll("input:checked")].map(i => i.value);
+  const r = { lattice: $("lattice").value, cell_map: $("cell_map").value, cell: num("cell"),
+    wall_min: num("wall_min"), wall_max: num("wall_max"), grading: $("grading").value,
+    skin: num("skin"), skin_surfaces: surfaces.includes("all") || !surfaces.length ? ["all"] : surfaces,
+    pitch: num("pitch") };
+  if (r.grading === "expr") r.grade_expr = $("grade_expr").value;
+  return r;
+}
+
+$("run").onclick = async () => {
+  $("run").disabled = true; $("download").disabled = $("import").disabled = true;
+  say("Starting…");
+  try {
+    let job;
+    if (inOnshape) {
+      job = await api("/api/jobs/onshape", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...doc, part_id: $("part").value, recipe: recipe() }) });
+    } else {
+      const f = $("file").files[0];
+      if (!f) throw new Error("choose a mesh file first");
+      const body = new FormData(); body.append("file", f); body.append("recipe", JSON.stringify(recipe()));
+      job = await api("/api/jobs/upload", { method: "POST", body });
+    }
+    jobId = job.id; poll();
+  } catch (e) { say(e.message, "bad"); $("run").disabled = false; }
+};
+
+async function poll() {
+  const j = await api(`/api/jobs/${jobId}`);
+  if (j.status === "done") {
+    const r = j.report;
+    say(`Done: ${r.triangles.toLocaleString()} triangles, ${r.part_volume_cm3} cm³, ` +
+        `${Math.round(r.relative_density * 100)}% dense, ${r.watertight ? "watertight" : "NOT watertight"}.`,
+        r.watertight ? "ok" : "bad");
+    $("download").disabled = $("import").disabled = $("run").disabled = false;
+  } else if (j.status === "failed") {
+    say(j.error, "bad"); $("run").disabled = false;
+  } else {
+    say(`${j.status}…\n` + j.log.slice(-4).join("\n")); setTimeout(poll, 2000);
+  }
+}
+
+$("download").onclick = () => { location.href = `/api/jobs/${jobId}/result.3mf`; };
+$("import").onclick = async () => {
+  $("import").disabled = true; say("Importing into Onshape…");
+  try { await api(`/api/jobs/${jobId}/import`, { method: "POST" }); say("Imported. Look for the new tab in this document.", "ok"); }
+  catch (e) { say("Import failed: " + e.message, "bad"); $("import").disabled = false; }
+};
+
+init().catch(e => say(e.message, "bad"));
+</script>
+</body>
+</html>

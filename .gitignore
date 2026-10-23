@@ -1,3 +1,5 @@
 out/
 __pycache__/
 *.egg-info/
+jobs/
+.pytest_cache/

@@ -8,6 +8,8 @@ dependencies = ["numpy", "scipy", "scikit-image", "trimesh", "manifold3d", "lxml
 [project.optional-dependencies]
 decimate = ["fast_simplification"]
 preview = ["matplotlib"]
+app = ["fastapi", "uvicorn", "httpx", "python-multipart"]
+test = ["pytest"]
 
 [project.scripts]
 lattice-helmet = "lattice_helmet.cli:main"

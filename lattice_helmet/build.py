@@ -212,6 +212,7 @@ def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
         _, inv, cnt = np.unique(np.sort(fc, axis=1), axis=0, return_inverse=True, return_counts=True)
         out = trimesh.Trimesh(v, fc[cnt[inv.ravel()] == 1], process=True)
         out.remove_unreferenced_vertices()
+    out = split_nonmanifold(out)
     out = drop_specks(out)
     if out.volume < 0:
         out.invert()
@@ -224,6 +225,62 @@ def _components(mesh):
     n = len(mesh.vertices)
     adj = coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n))
     return connected_components(adj, directed=False)
+
+
+def _edge_counts(faces, n):
+    f = faces.astype(np.int64)
+    e = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
+    keys, counts = np.unique(e[:, 0] * n + e[:, 1], return_counts=True)
+    return keys, counts
+
+
+def split_nonmanifold(mesh):
+    """Separate surface sheets that marching cubes joined along one edge.
+
+    In rare saddle cases two sheets share an edge (four faces on it). Each
+    vertex of such an edge gets one copy per fan of faces around it, so the
+    sheets touch but no longer share topology.
+    """
+    n = len(mesh.vertices)
+    keys, counts = _edge_counts(mesh.faces, n)
+    bad = keys[counts > 2]
+    if len(bad) == 0:
+        return mesh
+    manifold = set(keys[counts == 2].tolist())
+    faces = mesh.faces.copy()
+    verts = [mesh.vertices]
+    extra = n
+    for v in np.unique(np.concatenate([bad // n, bad % n])):
+        inc = np.nonzero((faces == v).any(axis=1))[0]
+        # Union faces around v that share a manifold edge through v.
+        parent = {int(f): int(f) for f in inc}
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        by_edge = {}
+        for f in inc:
+            for w in faces[f]:
+                if w == v:
+                    continue
+                key = min(v, w) * n + max(v, w)
+                if key in manifold:
+                    by_edge.setdefault(key, []).append(int(f))
+        for fs in by_edge.values():
+            for f in fs[1:]:
+                parent[find(f)] = find(fs[0])
+        groups = {}
+        for f in inc:
+            groups.setdefault(find(int(f)), []).append(int(f))
+        for fs in list(groups.values())[1:]:
+            verts.append(mesh.vertices[v][None])
+            for f in fs:
+                faces[f][faces[f] == v] = extra
+            extra += 1
+    return trimesh.Trimesh(np.vstack(verts), faces, process=False)
 
 
 def drop_specks(mesh, min_faces=500):
