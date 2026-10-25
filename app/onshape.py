@@ -2,7 +2,8 @@
 
 Uses API keys with HTTP Basic auth for now (ONSHAPE_ACCESS_KEY and
 ONSHAPE_SECRET_KEY). An OAuth bearer token can replace them once the app is
-registered, by passing `token=`.
+registered, by passing `token=`. With ONSHAPE_AUTH=proxy no credentials are
+sent, for environments whose egress proxy adds the Authorization header.
 
 Endpoint paths follow Onshape's public REST API but have not yet been run
 against cad.onshape.com from this environment; check them in the first live
@@ -24,11 +25,13 @@ class Onshape:
     def __init__(self, access_key=None, secret_key=None, token=None, base_url=BASE_URL, timeout=120):
         if token:
             auth, headers = None, {"Authorization": f"Bearer {token}"}
+        elif os.environ.get("ONSHAPE_AUTH") == "proxy":
+            auth, headers = None, {}
         else:
             access_key = access_key or os.environ.get("ONSHAPE_ACCESS_KEY")
             secret_key = secret_key or os.environ.get("ONSHAPE_SECRET_KEY")
             if not (access_key and secret_key):
-                raise OnshapeError("set ONSHAPE_ACCESS_KEY and ONSHAPE_SECRET_KEY, or pass an OAuth token")
+                raise OnshapeError("set ONSHAPE_ACCESS_KEY and ONSHAPE_SECRET_KEY, or pass an OAuth token, or set ONSHAPE_AUTH=proxy")
             auth, headers = (access_key, secret_key), {}
         headers["Accept"] = "application/json"
         self.http = httpx.Client(base_url=base_url, auth=auth, headers=headers,

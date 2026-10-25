@@ -96,7 +96,8 @@ Studio.
 
 ```
 pip install -e .[app]
-export ONSHAPE_ACCESS_KEY=...  ONSHAPE_SECRET_KEY=...   # Developer Portal > API keys
+export ONSHAPE_ACCESS_KEY=...  ONSHAPE_SECRET_KEY=...   # Onshape > My account > Developer > API keys
+# or, when a proxy injects the Authorization header: export ONSHAPE_AUTH=proxy
 uvicorn app.main:app --port 8000
 ```
 
