@@ -6,6 +6,7 @@ import trimesh
 from fastapi.testclient import TestClient
 
 from app.main import make_app
+from app.onshape import _metres_to_mm
 
 FAST = {"cell": 7.5, "pitch": 1.0, "wall_min": 1.2, "wall_max": 1.2, "cell_map": "conformal",
         "skin_surfaces": ["outer", "inner"]}
@@ -74,3 +75,10 @@ def test_upload_and_bad_recipe(client):
     files = {"file": ("shell.stl", io.BytesIO(_dome_stl()), "model/stl")}
     ok = client.post("/api/jobs/upload", files=files, data={"recipe": __import__("json").dumps(FAST)}).json()
     assert _wait(client, ok["id"])["status"] == "done"
+
+
+def test_stl_metres_to_mm():
+    box = trimesh.creation.box(extents=(0.1, 0.2, 0.3))
+    out = _metres_to_mm(box.export(file_type="stl"))
+    scaled = trimesh.load(io.BytesIO(out), file_type="stl")
+    assert scaled.extents == pytest.approx((100, 200, 300))

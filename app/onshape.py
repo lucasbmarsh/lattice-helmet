@@ -5,20 +5,33 @@ ONSHAPE_SECRET_KEY). An OAuth bearer token can replace them once the app is
 registered, by passing `token=`. With ONSHAPE_AUTH=proxy no credentials are
 sent, for environments whose egress proxy adds the Authorization header.
 
-Endpoint paths follow Onshape's public REST API but have not yet been run
-against cad.onshape.com from this environment; check them in the first live
-test.
+list_parts, export_stl and upload_file were checked live against
+cad.onshape.com on 2026-10-26.
 """
 
 import os
+import time
 
 import httpx
+import numpy as np
 
 BASE_URL = os.environ.get("ONSHAPE_BASE_URL", "https://cad.onshape.com")
 
 
 class OnshapeError(RuntimeError):
     pass
+
+
+_STL_FACET = np.dtype([("normal", "<f4", 3), ("v", "<f4", (3, 3)), ("attr", "<u2")])
+
+
+def _metres_to_mm(stl):
+    n = int.from_bytes(stl[80:84], "little")
+    if len(stl) != 84 + n * _STL_FACET.itemsize:
+        raise OnshapeError("STL export is not binary STL")
+    facets = np.frombuffer(stl, _STL_FACET, n, 84).copy()
+    facets["v"] *= 1000
+    return stl[:84] + facets.tobytes()
 
 
 class Onshape:
@@ -48,16 +61,37 @@ class Onshape:
         r = self._get(f"/api/parts/d/{did}/{wvm}/{wvmid}/e/{eid}")
         return [{"partId": p["partId"], "name": p.get("name", p["partId"])} for p in r.json()]
 
-    def export_stl(self, did, wvm, wvmid, eid, part_id):
-        """Binary STL of one part, in millimetres."""
-        r = self.http.get(
-            f"/api/partstudios/d/{did}/{wvm}/{wvmid}/e/{eid}/stl",
-            params={"partIds": part_id, "mode": "binary", "units": "millimeter", "grouping": "true"},
-            headers={"Accept": "application/vnd.onshape.v1+octet-stream"},
+    def export_stl(self, did, wvm, wvmid, eid, part_id, poll=1.0, max_wait=300):
+        """Binary STL of one part, in millimetres.
+
+        The translation API writes STL in metres whatever `unit` says, so the
+        vertices are scaled by 1000 here.
+
+        Uses the async translation API rather than the synchronous .../stl
+        endpoint, which redirects to a regional host (cad-usw2.onshape.com
+        /modelexport) that a proxy scoped to cad.onshape.com/api/ refuses.
+        """
+        r = self.http.post(
+            f"/api/partstudios/d/{did}/{wvm}/{wvmid}/e/{eid}/translations",
+            json={"formatName": "STL", "partIds": part_id, "storeInDocument": False,
+                  "stlMode": "BINARY", "grouping": True},
         )
         if r.status_code >= 400:
             raise OnshapeError(f"STL export -> {r.status_code}: {r.text[:300]}")
-        return r.content
+        t = r.json()
+        deadline = time.monotonic() + max_wait
+        while t.get("requestState") == "ACTIVE":
+            if time.monotonic() > deadline:
+                raise OnshapeError(f"STL export timed out after {max_wait}s")
+            time.sleep(poll)
+            t = self._get(f"/api/translations/{t['id']}").json()
+        if t.get("requestState") != "DONE":
+            raise OnshapeError(f"STL export failed: {t.get('failureReason')}")
+        r = self.http.get(f"/api/documents/d/{did}/externaldata/{t['resultExternalDataIds'][0]}",
+                          headers={"Accept": "application/octet-stream"})
+        if r.status_code >= 400:
+            raise OnshapeError(f"STL download -> {r.status_code}: {r.text[:300]}")
+        return _metres_to_mm(r.content)
 
     def upload_file(self, did, wid, filename, data, translate=False):
         """Add a file to the document as a blob element.
