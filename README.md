@@ -144,13 +144,13 @@ fly deploy
 
 ### Onshape OAuth app
 
-In the [Developer Portal](https://dev-portal.onshape.com), under OAuth
-applications, create an application:
+In Onshape, open My account > Developer > OAuth applications (this replaces
+the old Developer Portal) and create an application:
 
 - Type: integrated cloud app. Redirect URL: `https://<your host>/oauth/callback`.
   OAuth URL: `https://<your host>/panel/`.
-- Permissions: read your profile, read your documents, write to your
-  documents (the import adds a tab to the document).
+- Permissions: OAuth2ReadPII, OAuth2Read and OAuth2Write (the import adds a
+  tab to the document).
 - Copy the client id and secret (the secret is shown once) into the secrets above.
 
 Then, on the app's Extensions tab, add an extension with location "Element
