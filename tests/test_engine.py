@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import trimesh
 
-from lattice_helmet import LatticeSpec, build
+from lattice_helmet import LatticeSpec, build, preview
 from lattice_helmet import expr
 from lattice_helmet.fields import GRAPHS, lattice_kinds
 
@@ -57,6 +57,18 @@ def test_conformal_dome_is_printable():
                                    holes=[[0, 0, 52, 4]], **QUIET))
     assert part.is_watertight
     assert 0.1 < part.volume / dome.volume < 0.6
+
+
+
+def test_preview_is_quick_and_reuses_the_shell_sdf():
+    dome, cache = _dome(), {}
+    mesh, info = preview(dome, LatticeSpec(cell_map="conformal", cell=7.5, **QUIET), voxels=4e5, cache=cache)
+    assert len(mesh.faces) == info["triangles"] > 1000
+    assert info["pitch"] > 0.5  # coarser than the build's voxels
+    assert np.allclose(mesh.bounds, dome.bounds, atol=2 * info["pitch"])
+    n = len(cache)
+    preview(dome, LatticeSpec(lattice="octet", cell=10, **QUIET), voxels=4e5, cache=cache)
+    assert len(cache) == n  # same voxel size, so the SDF was reused
 
 
 def test_recipe_round_trip():

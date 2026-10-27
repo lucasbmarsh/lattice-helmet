@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -25,6 +25,7 @@ from lattice_helmet.maps import MAPS
 from .auth import OAuth, OAuthError
 from .jobs import JobQueue
 from .onshape import Onshape, OnshapeError
+from .shells import ShellStore, Superseded, pack
 
 WORKDIR = Path(os.environ.get("LATTICE_WORKDIR", "jobs"))
 
@@ -44,8 +45,9 @@ def _onshape_failed(e):
 def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
     app = FastAPI(title="Lattice helmet service")
     queue = JobQueue(workdir)
+    shells = ShellStore()
     oauth = OAuth.from_env() if oauth is _UNSET else oauth
-    app.state.queue, app.state.oauth = queue, oauth
+    app.state.queue, app.state.oauth, app.state.shells = queue, oauth, shells
 
     def make_client(token=None):
         try:
@@ -116,6 +118,70 @@ def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
         except (ValueError, TypeError) as e:
             raise HTTPException(422, str(e))
         return job.public()
+
+    # Shells for the live view: load once, then preview and build by id.
+
+    class OnshapePart(BaseModel):
+        did: str
+        wvm: str = "w"
+        wvmid: str
+        eid: str
+        part_id: str
+
+    def _add_shell(data, filetype, source=None):
+        try:
+            return shells.add(data, filetype, source).public()
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+
+    @app.post("/api/shells/onshape")
+    def shell_from_onshape(req: OnshapePart, token=Depends(user_token)):
+        try:
+            stl = make_client(token).export_stl(req.did, req.wvm, req.wvmid, req.eid, req.part_id)
+        except OnshapeError as e:
+            raise _onshape_failed(e)
+        return _add_shell(stl, "stl", req.model_dump())
+
+    @app.post("/api/shells/upload")
+    async def shell_from_upload(file: UploadFile = File(...), token=Depends(user_token)):
+        filetype = Path(file.filename or "shell.stl").suffix.lstrip(".").lower() or "stl"
+        return _add_shell(await file.read(), filetype)
+
+    def _shell(shell_id):
+        shell = shells.get(shell_id)
+        if not shell:
+            raise HTTPException(404, "no such shell; load the part again")
+        return shell
+
+    @app.get("/api/shells/{shell_id}/mesh")
+    def shell_mesh(shell_id: str):
+        return Response(pack(_shell(shell_id).mesh), media_type="application/octet-stream")
+
+    class PreviewReq(BaseModel):
+        recipe: dict = {}
+        detail: float = 1.0  # 1 = about 1.5 M voxels
+
+    @app.post("/api/shells/{shell_id}/preview")
+    def shell_preview(shell_id: str, req: PreviewReq, token=Depends(user_token)):
+        """A coarse mesh of the lattice part, in the same packed format as /mesh."""
+        shell = _shell(shell_id)
+        try:
+            mesh, info = shells.preview(shell, req.recipe, min(max(req.detail, 0.25), 4.0))
+        except Superseded:
+            raise HTTPException(409, "superseded by a newer preview")
+        except (ValueError, TypeError) as e:
+            raise HTTPException(422, str(e))
+        return Response(pack(mesh), media_type="application/octet-stream",
+                        headers={"X-Preview": json.dumps(info)})
+
+    class ShellJob(BaseModel):
+        recipe: dict = {}
+
+    @app.post("/api/shells/{shell_id}/build")
+    def shell_build(shell_id: str, req: ShellJob, token=Depends(user_token)):
+        """The full-resolution build of a loaded shell (same job flow as /api/jobs)."""
+        shell = _shell(shell_id)
+        return _submit(shell.data, req.recipe, shell.filetype, shell.source)
 
     @app.get("/api/jobs/{job_id}")
     def job_status(job_id: str):

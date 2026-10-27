@@ -106,12 +106,23 @@ Onshape the panel lists the Part Studio's parts, exports the chosen one as
 STL, builds the lattice, and offers the 3MF for download or imports it back
 into the document.
 
+The panel's 3D view shows the part as soon as it loads, then a coarse
+preview of the lattice part (about 1.5 M voxels, a few seconds) that re-runs
+whenever a setting changes. The section slider cuts it open so the lattice
+under the skin is visible. Walls thinner than a preview voxel are drawn
+thicker than they will print; Generate builds the real part. three.js r160
+(MIT) is vendored in `app/panel/vendor/`.
+
 | endpoint | does |
 |---|---|
 | `GET /api/options` | lattice types, cell maps and the default recipe |
 | `GET /api/parts?did&wvm&wvmid&eid` | parts in a Part Studio |
 | `POST /api/jobs/onshape` | export a part from Onshape and start a build |
 | `POST /api/jobs/upload` | start a build from an uploaded mesh |
+| `POST /api/shells/onshape`, `POST /api/shells/upload` | load a shell for the live view; returns its id |
+| `GET /api/shells/{id}/mesh` | the shell as packed float32 vertices + uint32 faces |
+| `POST /api/shells/{id}/preview` | coarse lattice part for a recipe, same packing |
+| `POST /api/shells/{id}/build` | start the full build of a loaded shell |
 | `GET /api/jobs/{id}` | status, log and report |
 | `GET /api/jobs/{id}/result.3mf` | the printable result |
 | `POST /api/jobs/{id}/import` | add the result to the source document |
