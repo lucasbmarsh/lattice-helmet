@@ -12,10 +12,63 @@ from scipy import ndimage
 SURFACES = ("outer", "inner", "rim")
 
 
-def default_center(mesh):
-    """Centre of the head: middle of the footprint, at the rim height."""
+AXES = {f"{s}{a}": (i, 1 if s == "+" else -1) for i, a in enumerate("xyz") for s in "+-"}
+
+
+def parse_up(up):
+    """'+z', '-y', 'x' ... as (axis index, sign)."""
+    up = up if up[0] in "+-" else "+" + up
+    if up not in AXES:
+        raise ValueError(f"up must be one of {sorted(AXES)} or 'auto'")
+    return AXES[up]
+
+
+def detect_up(mesh, n=64):
+    """Which way the crown points, as (axis index, sign).
+
+    The head goes in through the biggest opening, so look along each of the
+    six axis directions from the middle of the bounding box: the direction
+    in which most straight lines escape without crossing the shell is down.
+    """
+    from .sdf import inside_mask, make_grid
+
+    pitch = float(np.ptp(mesh.bounds, axis=0).max()) / n
+    grid = make_grid(mesh, pitch, margin=pitch)
+    solid = inside_mask(mesh, grid)
+    c = [s // 2 for s in solid.shape]
+    best, down = -1.0, (2, -1)
+    for i in range(3):
+        o = [j for j in range(3) if j != i]
+        # a bundle of lines through the middle 40% of the other two axes
+        sl = [slice(None)] * 3
+        for j in o:
+            w = max(1, int(0.2 * solid.shape[j]))
+            sl[j] = slice(c[j] - w, c[j] + w)
+        for sign in (-1, 1):
+            sl[i] = slice(0, c[i]) if sign < 0 else slice(c[i], None)
+            free = ~solid[tuple(sl)].any(axis=i)
+            score = float(free.mean())
+            # prefer -z, then -y, on a tie (the usual CAD conventions)
+            score += 1e-3 * ((i == 2) + 0.5 * (i == 1)) * (sign < 0)
+            if score > best:
+                best, down = score, (i, sign)
+    return down[0], -down[1]
+
+
+def default_center(mesh, up=(2, 1)):
+    """Centre of the head: the centre of the sphere that best fits the
+    shell's surface (area-weighted least squares), kept inside the bounding
+    box. For a plain dome that is the middle of the rim; for a helmet with
+    ear flaps it sits near ear level, so radial directions stay close to the
+    surface normal over the flaps too."""
+    p = mesh.triangles_center
+    w = mesh.area_faces / mesh.area_faces.sum()
+    # |p|^2 = 2 c.p + (r^2 - |c|^2): linear in c and k
+    A = np.hstack([2 * p, np.ones((len(p), 1))]) * np.sqrt(w)[:, None]
+    b = (p * p).sum(axis=1) * np.sqrt(w)
+    c = np.linalg.lstsq(A, b, rcond=None)[0][:3]
     lo, hi = mesh.bounds
-    return np.array([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, lo[2]])
+    return np.clip(c, lo, hi)
 
 
 def classify_faces(mesh, center, threshold=0.7):

@@ -15,7 +15,8 @@ import uuid
 import numpy as np
 import trimesh
 
-from lattice_helmet.build import SIM_GRADINGS, LatticeSpec, preview, sim_key
+from lattice_helmet.build import SIM_GRADINGS, LatticeSpec, axis_name, preview, sim_key
+from lattice_helmet.surfaces import detect_up
 
 
 @dataclass
@@ -28,7 +29,10 @@ class Shell:
     cache: dict = field(default_factory=dict)
 
     def public(self):
+        if "up" not in self.cache:
+            self.cache["up"] = detect_up(self.mesh)  # the same cache key build.resolve_up reads
         return {"id": self.id, "triangles": len(self.mesh.faces), "watertight": bool(self.mesh.is_watertight),
+                "up": axis_name(self.cache["up"]),
                 "bounds_mm": np.round(self.mesh.bounds, 1).tolist(), "source": self.source}
 
 

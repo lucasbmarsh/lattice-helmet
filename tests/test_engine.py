@@ -157,3 +157,50 @@ def test_stress_grading_thickens_the_loaded_root():
     solid = inside_mask(part, grid)
     x = grid.axis(0)
     assert solid[x < 15].mean() > 1.5 * solid[x > 45].mean()  # more material near the fixed end
+
+
+def _y_up(mesh):
+    m = mesh.copy()
+    m.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0]))  # +z -> +y
+    return m
+
+
+def test_up_direction_is_detected():
+    from lattice_helmet.surfaces import detect_up
+
+    dome = _dome()
+    assert detect_up(dome) == (2, 1)
+    assert detect_up(_y_up(dome)) == (1, 1)
+    flipped = dome.copy()
+    flipped.apply_transform(trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0]))
+    assert detect_up(flipped) == (2, -1)
+
+
+def test_geodesic_hex_runs_straight_through_and_ignores_orientation():
+    from lattice_helmet.fields import geodesic_hex, geodesic_points
+
+    assert len(geodesic_points(4)) == 162
+    # Walls are planes through the centre: the distance scales with radius
+    # along a ray, so a hole lines up from the inside to the outside.
+    d = np.array([0.3, 0.2, 0.93])
+    d /= np.linalg.norm(d)
+    near, far = (geodesic_hex(*(r * d), 10, (0, 0, 0), (2, 1), 60) for r in (50, 60))
+    assert far == pytest.approx(near * 60 / 50, rel=1e-4)
+
+    dome = _dome()
+    spec = dict(lattice="geodesic_hex", cell=12, wall_min=1.5, wall_max=1.5, skin=0, fillet=0, pitch=0.75, **QUIET)
+    a = build(dome, LatticeSpec(**spec))
+    b = build(_y_up(dome), LatticeSpec(**spec))
+    assert a.is_watertight and b.is_watertight
+    assert b.volume == pytest.approx(a.volume, rel=0.03)  # same part whichever way it was modelled
+
+
+def test_edge_zone_makes_a_solid_border():
+    dome = _dome()
+    spec = dict(lattice="geodesic_hex", cell=12, wall_min=1.5, wall_max=1.5, skin=0, fillet=0, pitch=0.75, **QUIET)
+    plain = build(dome, LatticeSpec(**spec)).volume
+    banded = build(dome, LatticeSpec(**spec, regions=[{"where": "5 - edge", "lattice": "solid", "blend": 1}]))
+    assert banded.is_watertight
+    # the rim is a 15 mm wide ring of radius 45..60; a 5 mm band is about a third of it in height
+    ring = np.pi * (60 ** 2 - 45 ** 2) * 5
+    assert banded.volume - plain == pytest.approx(ring * (1 - plain / dome.volume), rel=0.35)

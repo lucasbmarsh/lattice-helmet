@@ -13,7 +13,7 @@ from skimage.measure import marching_cubes
 
 from . import expr, fields, maps
 from .sdf import make_grid, mesh_sdf
-from .surfaces import SURFACES, default_center, surface_distances
+from .surfaces import SURFACES, default_center, detect_up, parse_up, surface_distances
 
 
 @dataclass
@@ -27,6 +27,7 @@ class LatticeSpec:
     jitter: float = 1.0  # Voronoi: how far seeds move from the cell centres, 0..1 of a cell
     cell_map: str = "rectangular"  # rectangular | cylindrical | spherical | conformal
     center: list = None  # helmet centre for curved maps and surfaces (default: rim centre)
+    up: str = "auto"  # which way the crown points: auto, +z, -y, ...
     pole: str = None  # spherical: pole axis (default x, poles at the ears); conformal: crown axis (default z)
     layers: int = None  # cells through the shell for the conformal map (default: auto)
     wall_min: float = 0.8  # wall / strut thickness where grading = 0, mm
@@ -153,8 +154,12 @@ def _env(x, y, z, s, aux):
     c = aux["center"]
     env = {"x": x, "y": y, "z": z, "depth": -s,
            "r": np.sqrt((x - c[0]) ** 2 + (y - c[1]) ** 2 + (z - c[2]) ** 2)}
+    i, sign = aux.get("up", (2, 1))
+    env["height"] = sign * ((x, y, z)[i] - c[i])  # mm above the rim, along the up direction
     if aux.get("shell_t") is not None:
         env["shell"] = aux["shell_t"]
+    if aux.get("edge") is not None:
+        env["edge"] = aux["edge"]  # mm from the nearest edge (rim) face
     return env
 
 
@@ -163,8 +168,10 @@ def _grading(spec, x, y, z, s, aux, bounds, env=None):
     lo, hi = bounds
     if spec.grading == "uniform":
         return np.float32(0)
-    if spec.grading == "z":
-        return np.clip((z - lo[2]) / max(hi[2] - lo[2], 1e-6), 0, 1)
+    if spec.grading == "z":  # height along the up direction, rim 0 to crown 1
+        i, sign = aux.get("up", (2, 1))
+        t = ((x, y, z)[i] - lo[i]) / max(hi[i] - lo[i], 1e-6)
+        return np.clip(t if sign > 0 else 1 - t, 0, 1)
     if spec.grading == "depth":
         return np.clip(-s / spec.grade_depth, 0, 1)
     if spec.grading == "point":
@@ -221,7 +228,8 @@ def _prepare(shell, spec, cache=None):
         sdf = mesh_sdf(shell, grid)
         if cache is not None:
             cache[key] = grid, sdf
-    center = np.asarray(spec.center if spec.center is not None else default_center(shell), dtype=np.float32)
+    up = resolve_up(shell, spec, cache)
+    center = np.asarray(spec.center if spec.center is not None else default_center(shell, up), dtype=np.float32)
 
     def surfaces():
         k = key + (tuple(center.tolist()),)
@@ -232,13 +240,30 @@ def _prepare(shell, spec, cache=None):
             cache[k] = surf
         return surf
 
-    return grid, sdf, center, surfaces
+    return grid, sdf, center, up, surfaces
+
+
+def resolve_up(shell, spec, cache=None):
+    """(axis index, sign) of the crown direction, detected when up is "auto"."""
+    if spec.up != "auto":
+        return parse_up(spec.up)
+    if cache is not None and "up" in cache:
+        return cache["up"]
+    up = detect_up(shell)
+    spec.log(f"up: {'+-'[up[1] < 0]}{'xyz'[up[0]]} (detected)")
+    if cache is not None:
+        cache["up"] = up
+    return up
+
+
+def axis_name(up):
+    return ("+" if up[1] > 0 else "-") + "xyz"[up[0]]
 
 
 def _chunks(shell, spec, compiled, cache=None):
     """Mesh the part slab by slab; yields (vertices, faces) per chunk."""
     t0 = time.time()
-    grid, sdf, center, surfaces = _prepare(shell, spec, cache)
+    grid, sdf, center, up, surfaces = _prepare(shell, spec, cache)
     spec.log(f"shell SDF done in {time.time() - t0:.1f}s")
 
     # The main lattice, then one entry per region: (spec, compiled grade expr, region).
@@ -248,7 +273,7 @@ def _chunks(shell, spec, compiled, cache=None):
         r = dict(r, _where=expr.compile_expr(r["where"]) if "where" in r else None)
         zones.append((sub, _validate(sub, allow_fill=True), r))
 
-    aux = {"center": center, "shell_t": None}
+    aux = {"center": center, "shell_t": None, "up": up, "edge": None}
     if any(z[0].grading in SIM_GRADINGS for z in zones):
         aux["sim_field"] = simulate(shell, next(z[0] for z in zones if z[0].grading in SIM_GRADINGS), cache)[0]
     surf = None
@@ -258,7 +283,7 @@ def _chunks(shell, spec, compiled, cache=None):
         used |= expr.names_used(r["_where"]) if r and r["_where"] is not None else set()
     conformal = any(z[0].cell_map == "conformal" and z[0].lattice not in FILLS for z in zones)
     need_shell_t = conformal or "shell" in used
-    if need_shell_t or set(spec.skin_surfaces) != {"all"}:
+    if need_shell_t or "edge" in used or set(spec.skin_surfaces) != {"all"}:
         surf = surfaces()
         spec.log("surfaces: " + ", ".join(f"{k}={'yes' if v is not None else 'none'}" for k, v in surf.items()))
     median_thick = None
@@ -268,6 +293,10 @@ def _chunks(shell, spec, compiled, cache=None):
             raise ValueError("conformal map needs both outer and inner surfaces; check `center`")
         aux["shell_t"] = np.clip(d_o / np.maximum(d_o + d_i, 1e-6), 0, 1)
         median_thick = float(np.median((d_o + d_i)[sdf < 0]))
+    if "edge" in used:
+        if surf["rim"] is None:
+            raise ValueError("this part has no edge (rim) surface for 'edge' to measure from")
+        aux["edge"] = surf["rim"]
 
     def layers_of(sub):
         if sub.cell_map != "conformal":
@@ -290,7 +319,8 @@ def _chunks(shell, spec, compiled, cache=None):
 
         h0, h1 = max(k0 - 1, 0), min(k1 + 1, nz)
         x, y, z = grid.coords(k0, k1)
-        slab_aux = dict(aux, shell_t=None if aux["shell_t"] is None else aux["shell_t"][:, :, k0:k1])
+        slab_aux = dict(aux, shell_t=None if aux["shell_t"] is None else aux["shell_t"][:, :, k0:k1],
+                        edge=None if aux["edge"] is None else aux["edge"][:, :, k0:k1])
         env = _env(x, y, z, s, slab_aux)
 
         def lattice(sub, comp):
@@ -299,12 +329,17 @@ def _chunks(shell, spec, compiled, cache=None):
                 return np.full(s.shape, -sub.cell if sub.lattice == "solid" else sub.cell, np.float32)
             # Lattice on the slab plus a one-slice halo, so the gradient is centred.
             hx, hy, hz = grid.coords(h0, h1)
-            shell_t = None if aux["shell_t"] is None else aux["shell_t"][:, :, h0:h1]
-            u, v, w = maps.map_coords(sub.cell_map, hx, hy, hz, sub.cell, center, ref_radius,
-                                      pole=sub.pole, shell_t=shell_t, layers=layers_of(sub))
-            R, mode = fields.raw_field(sub.lattice, u, v, w, sub.cell, sub.graph,
-                                       seed=sub.seed, jitter=sub.jitter)
-            del u, v, w
+            if sub.lattice in fields.RADIAL:
+                fn, m = fields.RADIAL[sub.lattice]
+                R, mode = fn(hx, hy, hz, sub.cell, center, up, ref_radius), (m, 1.0)
+            else:
+                shell_t = None if aux["shell_t"] is None else aux["shell_t"][:, :, h0:h1]
+                pole = sub.pole or (axis_name(up) if sub.cell_map in ("conformal", "cylindrical") else None)
+                u, v, w = maps.map_coords(sub.cell_map, hx, hy, hz, sub.cell, center, ref_radius,
+                                          pole=pole, shell_t=shell_t, layers=layers_of(sub))
+                R, mode = fields.raw_field(sub.lattice, u, v, w, sub.cell, sub.graph,
+                                           seed=sub.seed, jitter=sub.jitter)
+                del u, v, w
             gx, gy, gz = np.gradient(R, spec.pitch)
             crop = slice(k0 - h0, k0 - h0 + (k1 - k0))
             grad = np.sqrt(gx * gx + gy * gy + gz * gz)[:, :, crop]
@@ -418,7 +453,7 @@ def preview(shell, spec, voxels=1.5e6, max_faces=400_000, cache=None):
     pitch = max(spec.pitch, np.ceil(pitch * 4) / 4)  # quarter-mm steps, so the cache hits
 
     def floor(sub):
-        if sub.lattice in FILLS:
+        if sub.lattice in FILLS or sub.lattice in fields.RADIAL:
             return pitch
         one = np.zeros((1, 1, 1), dtype=np.float32)
         _, (mode, _) = fields.raw_field(sub.lattice, one, one, one, sub.cell, sub.graph)

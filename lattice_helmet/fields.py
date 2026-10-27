@@ -260,6 +260,74 @@ def voronoi_beam(u, v, w, cell, seed=0, jitter=1.0):
     return out.reshape(shape)
 
 
+def geodesic_points(freq, up=(2, 1)):
+    """Unit vectors of a class-I geodesic sphere of frequency `freq`
+    (10 freq^2 + 2 points): an icosahedron with each face cut into a
+    triangular grid, pushed out onto the sphere. Its Voronoi cells are
+    hexagons, plus 12 pentagons at the icosahedron's corners; one corner
+    points along `up`, so the crown gets a pentagon and the next five sit
+    63 degrees down."""
+    import trimesh
+
+    ico = trimesh.creation.icosahedron()
+    v = ico.vertices / np.linalg.norm(ico.vertices, axis=1, keepdims=True)
+    # Rotate so vertex 0 points along `up`.
+    target = np.zeros(3)
+    target[up[0]] = up[1]
+    R = trimesh.geometry.align_vectors(v[0], target)[:3, :3]
+    v = v @ R.T
+    pts = []
+    n = max(1, int(freq))
+    for a, b, c in ico.faces:
+        for i in range(n + 1):
+            for j in range(n + 1 - i):
+                k = n - i - j
+                pts.append((i * v[a] + j * v[b] + k * v[c]) / n)
+    pts = np.asarray(pts)
+    pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+    return np.unique(np.round(pts, 9), axis=0)
+
+
+def geodesic_hex(x, y, z, cell, center, up, ref_radius):
+    """Distance (mm) to the walls of hexagonal cells laid over a sphere
+    around `center` and run straight out from it.
+
+    Every wall lies in a plane through the centre (the bisector of two
+    neighbouring cell directions), so each hexagon sits flat on the dome
+    and its hole runs through the shell along the radius, which on a helmet
+    is close to the surface normal. `cell` is the hexagon size across the
+    flats at `ref_radius` (the shell's typical radius); cells grow with
+    radius, as on any radial pattern.
+    """
+    from scipy.spatial import cKDTree
+
+    freq = max(1, int(round(1.1071 * ref_radius / cell)))  # icosahedron edge = 1.1071 rad
+    seeds = geodesic_points(freq, up)
+    tree = cKDTree(seeds)
+    x, y, z = np.broadcast_arrays(x, y, z)
+    shape = x.shape
+    p = np.stack([(a - c).reshape(-1) for a, c in zip((x, y, z), center)], axis=1).astype(np.float32)
+    out = np.empty(len(p), dtype=np.float32)
+    block = 1 << 19
+    for s0 in range(0, len(p), block):
+        q = p[s0:s0 + block]
+        d = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-6)
+        _, idx = tree.query(d, k=7)  # nearest seed and its (5 or) 6 neighbours
+        s1 = seeds[idx[:, 0]]
+        best = np.full(len(q), np.inf, dtype=np.float32)
+        for k in range(1, 7):
+            e = s1 - seeds[idx[:, k]]
+            n = e / np.linalg.norm(e, axis=1, keepdims=True)
+            best = np.minimum(best, (q * n).sum(axis=1))  # distance to the plane through the centre
+        out[s0:s0 + block] = best
+    return out.reshape(shape)
+
+
+# Lattices laid out around the helmet centre in world coordinates, so they
+# ignore the cell map: name -> (function, mode).
+RADIAL = {"geodesic_hex": (geodesic_hex, "sheet")}
+
+
 # Lattices that are not TPMS or strut graphs: name -> (function, mode).
 # Their fields are already close to true distances, so no calibration.
 OTHER = {
@@ -273,7 +341,8 @@ RANDOM = {"voronoi", "voronoi_surface"}
 
 def lattice_kinds():
     sheets = sorted(TPMS)
-    return sheets + [f"{s}_network" for s in sheets] + sorted(GRAPHS) + sorted(OTHER) + ["custom"]
+    return (sheets + [f"{s}_network" for s in sheets] + sorted(GRAPHS) + sorted(OTHER) + sorted(RADIAL)
+            + ["custom"])
 
 
 def raw_field(kind, u, v, w, cell, graph=None, seed=0, jitter=1.0):

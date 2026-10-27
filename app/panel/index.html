@@ -58,6 +58,8 @@
   <legend>Shell</legend>
   <label id="part-row">Part <select id="part"></select></label>
   <label id="file-row" class="hidden">Mesh file <input id="file" type="file" accept=".stl,.obj,.3mf"></label>
+  <label>Up direction <select id="up" title="which way the crown points">
+    <option value="auto">auto</option><option>+x</option><option>-x</option><option>+y</option><option>-y</option><option>+z</option><option>-z</option></select></label>
 </fieldset>
 
 <fieldset>
@@ -214,8 +216,11 @@ async function init() {
   $("lattice").onchange = () => $("seed-row").classList.toggle("hidden", !$("lattice").value.startsWith("voronoi"));
   latticeKinds = o.lattices;
   fill("material", Object.keys(o.materials), "PETG");
-  fixedZone = zoneEditor($("sim-fixed"), { shape: "below" });
-  loadZone = zoneEditor($("sim-load"), { shape: "sphere" });
+  // The analysis only knows x, y and z, so its zones can't follow the edges.
+  const simShapes = ["below", "above", "sphere", "box", "where"];
+  fixedZone = zoneEditor($("sim-fixed"), { shape: "below", shapes: simShapes });
+  loadZone = zoneEditor($("sim-load"), { shape: "sphere", shapes: simShapes });
+  $("up").onchange = () => { resetZones(); if (shellBounds) frame(); schedulePreview(0); };
 
   authMode = o.auth || "server";
   if (authMode === "oauth") { tokens = store.get(); if (!tokens) showSignIn(true); }
@@ -244,21 +249,32 @@ async function loadParts() {
 // [...]} or {"where": expr}; lattice zones add their own lattice settings.
 
 const SIM_GRADINGS = ["stress", "topopt"];
-const SHAPES = { above: "Above a height", below: "Below a height", sphere: "Ball around a point",
-                 box: "Box", where: "Expression" };
-let latticeKinds = [], zones = [], fixedZone = null, loadZone = null;
+const SHAPES = { edge: "Along the edges", above: "Above a height", below: "Below a height",
+                 sphere: "Ball around a point", box: "Box", where: "Expression" };
+let latticeKinds = [], zones = [], fixedZone = null, loadZone = null, detectedUp = "+z";
 
 function bounds() { return shellBounds || [[-100, -100, 0], [100, 100, 120]]; }
+// The crown direction as [axis index, sign]: the panel's choice, else what the service detected.
+function upAxis() {
+  const u = $("up").value === "auto" ? detectedUp : $("up").value;
+  return ["xyz".indexOf(u[1]), u[0] === "-" ? -1 : 1];
+}
+
+// Heights are measured along the up direction, as a coordinate on that axis.
+function heightAt(t) {
+  const [lo, hi] = bounds(), [i, s] = upAxis();
+  return Math.round(s > 0 ? lo[i] + t * (hi[i] - lo[i]) : hi[i] - t * (hi[i] - lo[i]));
+}
 
 function zoneDefaults(shape) {
   const [lo, hi] = bounds(), c = lo.map((v, i) => (v + hi[i]) / 2), r = v => Math.round(v);
-  const span = Math.max(...hi.map((v, i) => v - lo[i]));
-  return { above: [r(lo[2] + 0.66 * (hi[2] - lo[2]))], below: [r(lo[2] + 0.12 * (hi[2] - lo[2]))],
-           sphere: [r(c[0]), r(c[1]), r(hi[2]), r(span / 6)],
-           box: [r(lo[0]), r(lo[1]), r(lo[2]), r(c[0]), r(hi[1]), r(hi[2])], where: ["z - 80"] }[shape];
+  const span = Math.max(...hi.map((v, i) => v - lo[i])), [i, s] = upAxis();
+  const crown = c.map(r); crown[i] = r(s > 0 ? hi[i] : lo[i]);
+  return { edge: [5], above: [heightAt(0.66)], below: [heightAt(0.12)], sphere: [...crown, r(span / 6)],
+           box: [r(lo[0]), r(lo[1]), r(lo[2]), r(c[0]), r(hi[1]), r(hi[2])], where: ["5 - edge"] }[shape];
 }
 
-function zoneEditor(host, { shape = "sphere", lattice = false, onRemove } = {}) {
+function zoneEditor(host, { shape = "sphere", lattice = false, onRemove, shapes = Object.keys(SHAPES) } = {}) {
   const el = document.createElement("div");
   el.className = lattice ? "zone" : "";
   host.append(el);
@@ -268,12 +284,14 @@ function zoneEditor(host, { shape = "sphere", lattice = false, onRemove } = {}) 
   const nums = (n, step = 1) => `<span class="row">${Array.from({ length: n }, (_, i) =>
     `<input data-v="${i}" type="number" step="${step}">`).join("")}</span>`;
   function render() {
-    const opts = Object.entries(SHAPES).map(([k, v]) => `<option value="${k}" ${k === ed.shape ? "selected" : ""}>${v}</option>`).join("");
-    let body = { above: field("Height z, mm", nums(1)), below: field("Height z, mm", nums(1)),
+    const opts = shapes.map(k => `<option value="${k}" ${k === ed.shape ? "selected" : ""}>${SHAPES[k]}</option>`).join("");
+    const axis = "xyz"[upAxis()[0]];
+    let body = { edge: field("Width, mm", `<input data-v="0" type="number" min="0.5" step="0.5" title="how far in from every edge of the part">`),
+      above: field(`Height ${axis}, mm`, nums(1)), below: field(`Height ${axis}, mm`, nums(1)),
       sphere: field("Centre x y z", nums(3)) + field("Radius, mm", `<input data-v="3" type="number" min="1">`),
       box: field("From x y z", nums(3)) + field("To x y z", `<span class="row">${[3, 4, 5].map(i =>
         `<input data-v="${i}" type="number">`).join("")}</span>`),
-      where: field("Inside where", `<input data-v="0" placeholder="positive inside, e.g. z - 80">`) }[ed.shape];
+      where: field("Inside where", `<input data-v="0" placeholder="positive inside, e.g. 5 - edge or y - 80">`) }[ed.shape];
     if (lattice) {
       const kinds = ["solid", "empty", ...latticeKinds].map(k =>
         `<option ${k === ed.lattice.lattice ? "selected" : ""}>${k}</option>`).join("");
@@ -296,8 +314,11 @@ function zoneEditor(host, { shape = "sphere", lattice = false, onRemove } = {}) 
     if (t.dataset.l === "lattice") el.querySelector("[data-cellwall]").classList.toggle("hidden", ["solid", "empty"].includes(t.value));
     drawZones();
   });
+  ed.render = render;
   ed.get = () => {
-    const v = ed.values, z = { above: { where: `z - ${v[0]}` }, below: { where: `${v[0]} - z` },
+    const v = ed.values, [i, s] = upAxis(), a = "xyz"[i];
+    const up = `${a} - ${v[0]}`, down = `${v[0]} - ${a}`;
+    const z = { edge: { where: `${v[0]} - edge` }, above: { where: s > 0 ? up : down }, below: { where: s > 0 ? down : up },
       sphere: { sphere: v.slice(0, 4) }, box: { box: v.slice(0, 6) }, where: { where: String(v[0]) } }[ed.shape];
     if (lattice) {
       const l = ed.lattice;
@@ -311,7 +332,8 @@ function zoneEditor(host, { shape = "sphere", lattice = false, onRemove } = {}) 
 }
 
 $("add-zone").onclick = () => {
-  zones.push(zoneEditor($("zones"), { lattice: true, onRemove: ed => { zones = zones.filter(z => z !== ed); } }));
+  zones.push(zoneEditor($("zones"), { shape: zones.length ? "sphere" : "edge", lattice: true,
+                                      onRemove: ed => { zones = zones.filter(z => z !== ed); } }));
   drawZones(); schedulePreview();
 };
 
@@ -331,6 +353,7 @@ function recipe() {
   if (r.grading === "expr") r.grade_expr = $("grade_expr").value;
   if (r.lattice.startsWith("voronoi")) r.seed = parseInt($("seed").value) || 0;
   r.regions = zones.map(z => z.get());
+  r.up = $("up").value;
   if (SIM_GRADINGS.includes(r.grading)) { r.simulation = simulation(); if (r.grading === "topopt") r.topopt = topoSettings(); }
   return r;
 }
@@ -395,7 +418,7 @@ view.prepend(renderer.domElement);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(35, 1, 1, 10000);
 camera.up.set(0, 0, 1);  // Onshape is Z-up
-const controls = new OrbitControls(camera, renderer.domElement);
+let controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 scene.add(new THREE.HemisphereLight(0xffffff, 0x666670, 1.6));
 const sun = new THREE.DirectionalLight(0xffffff, 1.6);
@@ -440,8 +463,17 @@ function frame() {
   const [lo, hi] = shellBounds;
   const c = new THREE.Vector3(...lo).add(new THREE.Vector3(...hi)).multiplyScalar(0.5);
   const r = new THREE.Vector3(...hi).sub(new THREE.Vector3(...lo)).length() / 2;
+  // Orbit around the part's up direction. OrbitControls reads camera.up
+  // only when it is made, so make a new one when that changes.
+  const [i, sg] = upAxis(), up = [0, 0, 0]; up[i] = sg;
+  if (!camera.up.equals(new THREE.Vector3(...up))) {
+    camera.up.set(...up);
+    controls.dispose(); controls = new OrbitControls(camera, renderer.domElement); controls.enableDamping = true;
+  }
+  const off = [0, 0, 0], [a, b] = [0, 1, 2].filter(k => k !== i);
+  off[a] = 1.2; off[b] = -2.2; off[i] = 1.1 * sg;
   controls.target.copy(c);
-  camera.position.copy(c).add(new THREE.Vector3(1.2, -2.2, 1.1).normalize().multiplyScalar(r * 3.2));
+  camera.position.copy(c).add(new THREE.Vector3(...off).normalize().multiplyScalar(r * 3.2));
   camera.near = r / 50; camera.far = r * 50; camera.updateProjectionMatrix();
 }
 
@@ -491,11 +523,11 @@ async function loadShell() {
       s = await api("/api/shells/upload", { method: "POST", body });
     }
     const buf = await (await api(`/api/shells/${s.id}/mesh`, { raw: true })).arrayBuffer();
-    shellId = s.id; shellBounds = s.bounds_mm;
+    shellId = s.id; shellBounds = s.bounds_mm; detectedUp = s.up || "+z";
+    $("up").options[0].textContent = `auto (${detectedUp})`;
     setGroup(groups.shell, unpack(buf), [mats.part, mats.inside]);
     frame(); applyCut(); showGhost();
-    if (fixedZone) { for (const ed of [fixedZone, loadZone]) { ed.values = zoneDefaults(ed.shape); ed.el.querySelectorAll("[data-v]").forEach(i => { i.value = ed.values[+i.dataset.v]; }); } }
-    drawZones();
+    resetZones();
     const size = shellBounds[1].map((v, i) => Math.round(v - shellBounds[0][i])).join(" × ");
     $("view-info").textContent = `${size} mm` + (s.watertight ? "" : " · not watertight, the lattice may leak");
     viewMsg("");
@@ -539,25 +571,33 @@ async function runPreview() {
 
 // ---- zones in the view -----------------------------------------------------
 
-function zoneObject(z, fill, edge) {
-  const [lo, hi] = bounds(), pad = 5;
+function zoneObject(ed, fill, edge) {
+  const [lo, hi] = bounds(), pad = 5, v = ed.values, [i, sg] = upAxis();
   let geo, pos = new THREE.Vector3();
-  if (z.sphere) { geo = new THREE.SphereGeometry(Math.max(z.sphere[3], 0.1), 32, 16); pos.set(...z.sphere.slice(0, 3)); }
-  else if (z.box) {
-    const a = z.box.slice(0, 3), b = z.box.slice(3, 6);
-    geo = new THREE.BoxGeometry(...a.map((v, i) => Math.abs(b[i] - v) || 0.1));
-    pos.set(...a.map((v, i) => (v + b[i]) / 2));
-  } else {
-    const m = /^z - (-?[\d.]+)$/.exec(z.where) || /^(-?[\d.]+) - z$/.exec(z.where);
-    if (!m) return null;  // a free-form expression has no simple shape to draw
-    const h = +m[1], above = z.where.startsWith("z"), top = above ? hi[2] + pad : h, bot = above ? h : lo[2] - pad;
-    geo = new THREE.BoxGeometry(hi[0] - lo[0] + 2 * pad, hi[1] - lo[1] + 2 * pad, Math.max(top - bot, 0.1));
-    pos.set((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (top + bot) / 2);
-  }
+  if (ed.shape === "sphere") { geo = new THREE.SphereGeometry(Math.max(v[3], 0.1), 32, 16); pos.set(...v.slice(0, 3)); }
+  else if (ed.shape === "box") {
+    const a = v.slice(0, 3), b = v.slice(3, 6);
+    geo = new THREE.BoxGeometry(...a.map((x, k) => Math.abs(b[k] - x) || 0.1));
+    pos.set(...a.map((x, k) => (x + b[k]) / 2));
+  } else if (ed.shape === "above" || ed.shape === "below") {
+    // A slab across the whole part, from the height to the crown or past the rim.
+    const towardCrown = (ed.shape === "above") === (sg > 0);
+    const end = towardCrown ? hi[i] + pad : lo[i] - pad, h = v[0];
+    const size = hi.map((x, k) => x - lo[k] + 2 * pad), c = lo.map((x, k) => (x + hi[k]) / 2);
+    size[i] = Math.max(Math.abs(end - h), 0.1); c[i] = (end + h) / 2;
+    geo = new THREE.BoxGeometry(...size); pos.set(...c);
+  } else return null;  // edges and free-form expressions have no simple shape to draw
   const g = new THREE.Group();
   g.add(new THREE.Mesh(geo, fill), new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), edge));
   g.position.copy(pos);
   return g;
+}
+
+// Defaults (and height labels) follow the shell's size and up direction.
+function resetZones() {
+  for (const ed of [fixedZone, loadZone]) if (ed) { ed.values = zoneDefaults(ed.shape); ed.render(); }
+  for (const ed of zones) ed.render();
+  drawZones();
 }
 
 function drawZones() {
@@ -565,9 +605,9 @@ function drawZones() {
   groups.zones.clear();
   if (!$("show-zones").checked) return;
   const add = (z, f, e) => { try { const o = zoneObject(z, f, e); if (o) groups.zones.add(o); } catch {} };
-  for (const ed of zones) add(ed.get(), mats.zone, mats.zoneEdge);
-  if (fixedZone) add(fixedZone.get(), mats.fixed, mats.fixedEdge);
-  if (loadZone) add(loadZone.get(), mats.load, mats.loadEdge);
+  for (const ed of zones) add(ed, mats.zone, mats.zoneEdge);
+  if (fixedZone) add(fixedZone, mats.fixed, mats.fixedEdge);
+  if (loadZone) add(loadZone, mats.load, mats.loadEdge);
 }
 $("show-zones").onchange = drawZones;
 

@@ -21,11 +21,14 @@ _AXES = {"x": 0, "y": 1, "z": 2}
 
 
 def _frame(x, y, z, center, pole):
-    """Coordinates relative to `center`, rotated so the pole axis is last."""
+    """Coordinates relative to `center`, rotated so the pole axis is last.
+    A pole like "-y" points the last axis down y (and flips one of the
+    others, so the frame stays right-handed)."""
     p = [x - center[0], y - center[1], z - center[2]]
-    i = _AXES[pole]
+    sign = -1 if pole.startswith("-") else 1
+    i = _AXES[pole.lstrip("+-")]
     a, b = [p[j] for j in range(3) if j != i]
-    return a, b, p[i]
+    return a, b * sign, p[i] * sign
 
 
 def _whole(length, cell):
@@ -43,7 +46,7 @@ def map_coords(kind, x, y, z, cell, center, ref_radius, pole=None, shell_t=None,
     if kind == "rectangular":
         return x, y, z
     if kind == "cylindrical":
-        a, b, h = _frame(x, y, z, center, "z")
+        a, b, h = _frame(x, y, z, center, pole or "z")
         n = _whole(2 * np.pi * ref_radius, cell)
         theta = np.arctan2(b, a)
         return theta * np.float32(n * cell / (2 * np.pi)), h, np.sqrt(a * a + b * b)
