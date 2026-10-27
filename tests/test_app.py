@@ -63,7 +63,8 @@ def _wait(client, job_id):
 def test_options_and_panel(client):
     o = client.get("/api/options").json()
     assert "gyroid" in o["lattices"] and "conformal" in o["cell_maps"]
-    assert "Lattice helmet" in client.get("/panel/").text
+    panel = client.get("/panel/")
+    assert "Lattice helmet" in panel.text and panel.headers["cache-control"] == "no-cache"
 
 
 def test_onshape_round_trip(client):

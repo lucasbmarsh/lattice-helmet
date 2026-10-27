@@ -47,6 +47,16 @@ def _onshape_failed(e):
 
 def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
     app = FastAPI(title="Lattice helmet service")
+
+    @app.middleware("http")
+    async def panel_revalidates(request: Request, call_next):
+        # Without this, browsers reuse a cached panel for days after a deploy
+        # (heuristic caching from Last-Modified). no-cache still lets them
+        # keep it, but they check the ETag first, so a deploy shows at once.
+        response = await call_next(request)
+        if request.url.path.startswith("/panel"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
     queue = JobQueue(workdir)
     shells = ShellStore()
     oauth = OAuth.from_env() if oauth is _UNSET else oauth
