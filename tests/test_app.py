@@ -176,3 +176,44 @@ def test_oauth_sign_in_and_allow_list(oauth_client):
 def test_oauth_callback_rejects_unknown_state(oauth_client):
     r = oauth_client.get("/oauth/callback", params={"state": "x" * 30, "code": "good-code"})
     assert r.status_code == 400
+
+
+SIM = {"material": "PETG", "voxel": 4.0,
+       "fixed": [{"where": "8 - z"}], "loads": [{"sphere": [0, 0, 60, 15], "force": [0, 0, -500]}]}
+
+
+def test_simulation_then_stress_graded_preview(client):
+    files = {"file": ("shell.stl", io.BytesIO(_dome_stl()), "model/stl")}
+    s = client.post("/api/shells/upload", files=files).json()
+    recipe = dict(FAST, grading="stress", simulation=SIM, wall_min=0.6, wall_max=2.0)
+    # Not analysed yet: the preview asks for the analysis instead of running it.
+    r = client.post(f"/api/shells/{s['id']}/preview", json={"recipe": recipe, "detail": 0.25})
+    assert r.status_code == 422 and "Run analysis" in r.json()["detail"]
+    assert client.post(f"/api/shells/{s['id']}/simulate", json={"simulation": {"fixed": []}}).status_code == 422
+
+    job = client.post(f"/api/shells/{s['id']}/simulate", json={"simulation": SIM}).json()
+    j = _wait(client, job["id"])
+    assert j["status"] == "done", j
+    assert j["report"]["max_displacement_mm"] > 0 and j["report"]["mode"] == "analysis"
+    data = client.get(f"/api/sims/{job['id']}/mesh", params={"field": "stress"}).content
+    nv, nf = struct.unpack_from("<II", data)
+    assert len(data) == 8 + 12 * nv + 12 * nf + 4 * nv
+    r = client.post(f"/api/shells/{s['id']}/preview", json={"recipe": recipe, "detail": 0.25})
+    assert r.status_code == 200
+
+
+def test_topopt_job_gives_a_part(client):
+    s = client.post("/api/shells/onshape", json=dict(did="d", wvmid="w1", eid="e", part_id="JHD")).json()
+    job = client.post(f"/api/shells/{s['id']}/simulate",
+                      json={"simulation": SIM, "mode": "topopt", "topopt": {"volume_fraction": 0.4, "iterations": 4}}).json()
+    j = _wait(client, job["id"])
+    assert j["status"] == "done", j
+    assert 0.2 < j["report"]["volume_fraction"] < 0.7
+    assert client.get(f"/api/jobs/{job['id']}/result.3mf").status_code == 200
+    assert client.post(f"/api/jobs/{job['id']}/import").status_code == 200
+
+
+def test_zones_and_new_lattices_in_options(client):
+    o = client.get("/api/options").json()
+    assert {"voronoi", "honeycomb_tri", "honeycomb_hex"} <= set(o["lattices"])
+    assert "stress" in o["gradings"] and "PETG" in o["materials"]

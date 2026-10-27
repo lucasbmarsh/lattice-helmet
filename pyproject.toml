@@ -3,7 +3,7 @@ name = "lattice-helmet"
 version = "0.1.0"
 description = "Field-driven lattice infill for helmet shells"
 requires-python = ">=3.10"
-dependencies = ["numpy", "scipy", "scikit-image", "trimesh", "manifold3d", "lxml", "networkx"]
+dependencies = ["numpy", "scipy", "scikit-image", "trimesh", "manifold3d", "lxml", "networkx", "pyamg"]
 
 [project.optional-dependencies]
 decimate = ["fast_simplification"]

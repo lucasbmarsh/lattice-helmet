@@ -34,6 +34,14 @@
   #view-tools { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center; }
   #view-tools select { width: auto; } #view-tools input[type=range] { padding: 0; }
   #view-tools .checks { grid-column: 1 / -1; }
+  .zone { border: 1px dashed var(--line); border-radius: 6px; padding: 4px 8px; margin: 6px 0; }
+  .zone-head { display: flex; gap: 6px; align-items: center; } .zone-head select { flex: 1; }
+  .zone-head button, button.small { width: auto; padding: 2px 8px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 2px 0 4px; }
+  #legend { position: absolute; right: 8px; top: 8px; bottom: 28px; width: 92px; display: flex; gap: 6px; font-size: 11px; color: var(--fg); pointer-events: none; }
+  #legend.hidden { display: none; }
+  #legend .bar { width: 14px; border-radius: 3px; border: 1px solid var(--line); }
+  #legend .ticks { display: flex; flex-direction: column; justify-content: space-between; }
 </style>
 </head>
 <body>
@@ -58,8 +66,31 @@
   <label>Cell map <select id="cell_map"></select></label>
   <label>Cell size, mm <input id="cell" type="number" step="0.5" min="2"></label>
   <label>Wall, mm <span class="row"><input id="wall_min" type="number" step="0.1" min="0" title="where grading = 0"><input id="wall_max" type="number" step="0.1" min="0" title="where grading = 1"></span></label>
+  <label id="seed-row" class="hidden">Random seed <input id="seed" type="number" step="1" value="0" title="change for a different random foam"></label>
   <label>Grading <select id="grading"></select></label>
   <label id="expr-row" class="hidden">Expression <input id="grade_expr" placeholder="smoothstep(0, 90, dist(x, y, z, 0, 0, 125))"></label>
+  <p id="sim-grade-hint" class="hint hidden">Walls go from the first thickness where the simulation says the
+    material isn't needed to the second where it is. Set up the simulation below.</p>
+</fieldset>
+
+<fieldset id="zones-box">
+  <legend>Zones</legend>
+  <p class="hint">Give parts of the helmet their own lattice, or make them solid (straps, mounts) or empty.
+    Later zones win where they overlap. Zones show in orange in the view.</p>
+  <div id="zones"></div>
+  <button id="add-zone" class="secondary small">+ Add zone</button>
+</fieldset>
+
+<fieldset id="sim-box">
+  <legend>Simulation</legend>
+  <label>Material <select id="material"></select></label>
+  <div class="zone"><div class="hint">Held in place at</div><div id="sim-fixed"></div></div>
+  <div class="zone"><div class="hint">Pushed on at</div><div id="sim-load"></div>
+    <label>Force, N <span class="row"><input id="fx" type="number" value="0" title="x"><input id="fy" type="number" value="0" title="y"><input id="fz" type="number" value="-500" title="z"></span></label>
+  </div>
+  <div class="row"><button id="analyze" class="secondary">Run analysis</button><button id="optimize" class="secondary">Optimise shape</button></div>
+  <label>Keep, % <input id="keep" type="number" value="30" min="5" max="90" step="5" title="share of the material topology optimisation keeps"></label>
+  <div class="row" style="margin-top:6px"><button id="sim-download" class="secondary hidden" disabled>Download optimised 3MF</button><button id="sim-import" class="secondary hidden" disabled>Import into Onshape</button></div>
 </fieldset>
 
 <fieldset>
@@ -78,13 +109,16 @@
 </div>
 
 <div id="view-col">
-  <div id="viewer"><div id="view-msg">Load a part to see it here.</div><div id="view-info"></div></div>
+  <div id="viewer"><div id="view-msg">Load a part to see it here.</div><div id="view-info"></div>
+    <div id="legend" class="hidden"><div class="bar"></div><div class="ticks"></div></div></div>
   <div id="view-tools">
     Section <input id="cut" type="range" min="0" max="1000" value="1000" title="slide to cut the part open">
     <select id="cut-axis"><option value="0">X</option><option value="1" selected>Y</option><option value="2">Z</option></select>
     <div class="checks">
       <label><input id="live" type="checkbox" checked>Live preview</label>
       <label><input id="ghost" type="checkbox" checked>Show shell</label>
+      <label><input id="show-zones" type="checkbox" checked>Show zones</label>
+      <label id="result-row" class="hidden">View <select id="result-view"><option value="lattice">lattice preview</option><option value="displacement">displacement</option><option value="stress">stress</option></select></label>
       <label>Detail <select id="detail"><option value="0.5">coarse</option><option value="1" selected>normal</option><option value="3">fine</option></select></label>
     </div>
   </div>
@@ -173,7 +207,15 @@ async function init() {
   for (const k of ["cell", "wall_min", "wall_max", "skin", "pitch"]) $(k).value = d[k];
   $("skin_surfaces").innerHTML = o.skin_surfaces.map(s =>
     `<label><input type="checkbox" value="${s}" ${s === "all" ? "checked" : ""}>${s}</label>`).join("");
-  $("grading").onchange = () => $("expr-row").classList.toggle("hidden", $("grading").value !== "expr");
+  $("grading").onchange = () => {
+    $("expr-row").classList.toggle("hidden", $("grading").value !== "expr");
+    $("sim-grade-hint").classList.toggle("hidden", !SIM_GRADINGS.includes($("grading").value));
+  };
+  $("lattice").onchange = () => $("seed-row").classList.toggle("hidden", !$("lattice").value.startsWith("voronoi"));
+  latticeKinds = o.lattices;
+  fill("material", Object.keys(o.materials), "PETG");
+  fixedZone = zoneEditor($("sim-fixed"), { shape: "below" });
+  loadZone = zoneEditor($("sim-load"), { shape: "sphere" });
 
   authMode = o.auth || "server";
   if (authMode === "oauth") { tokens = store.get(); if (!tokens) showSignIn(true); }
@@ -197,6 +239,88 @@ async function loadParts() {
   await loadShell();
 }
 
+// ---- zones ---------------------------------------------------------------
+// A zone editor makes the dicts build.py reads: {"box": [...]}, {"sphere":
+// [...]} or {"where": expr}; lattice zones add their own lattice settings.
+
+const SIM_GRADINGS = ["stress", "topopt"];
+const SHAPES = { above: "Above a height", below: "Below a height", sphere: "Ball around a point",
+                 box: "Box", where: "Expression" };
+let latticeKinds = [], zones = [], fixedZone = null, loadZone = null;
+
+function bounds() { return shellBounds || [[-100, -100, 0], [100, 100, 120]]; }
+
+function zoneDefaults(shape) {
+  const [lo, hi] = bounds(), c = lo.map((v, i) => (v + hi[i]) / 2), r = v => Math.round(v);
+  const span = Math.max(...hi.map((v, i) => v - lo[i]));
+  return { above: [r(lo[2] + 0.66 * (hi[2] - lo[2]))], below: [r(lo[2] + 0.12 * (hi[2] - lo[2]))],
+           sphere: [r(c[0]), r(c[1]), r(hi[2]), r(span / 6)],
+           box: [r(lo[0]), r(lo[1]), r(lo[2]), r(c[0]), r(hi[1]), r(hi[2])], where: ["z - 80"] }[shape];
+}
+
+function zoneEditor(host, { shape = "sphere", lattice = false, onRemove } = {}) {
+  const el = document.createElement("div");
+  el.className = lattice ? "zone" : "";
+  host.append(el);
+  const ed = { el, shape, values: zoneDefaults(shape),
+    lattice: lattice ? { lattice: "solid", cell: +$("cell").value || 10, wall: +$("wall_min").value || 0.8, blend: 4 } : null };
+  const field = (label, html) => `<label>${label} ${html}</label>`;
+  const nums = (n, step = 1) => `<span class="row">${Array.from({ length: n }, (_, i) =>
+    `<input data-v="${i}" type="number" step="${step}">`).join("")}</span>`;
+  function render() {
+    const opts = Object.entries(SHAPES).map(([k, v]) => `<option value="${k}" ${k === ed.shape ? "selected" : ""}>${v}</option>`).join("");
+    let body = { above: field("Height z, mm", nums(1)), below: field("Height z, mm", nums(1)),
+      sphere: field("Centre x y z", nums(3)) + field("Radius, mm", `<input data-v="3" type="number" min="1">`),
+      box: field("From x y z", nums(3)) + field("To x y z", `<span class="row">${[3, 4, 5].map(i =>
+        `<input data-v="${i}" type="number">`).join("")}</span>`),
+      where: field("Inside where", `<input data-v="0" placeholder="positive inside, e.g. z - 80">`) }[ed.shape];
+    if (lattice) {
+      const kinds = ["solid", "empty", ...latticeKinds].map(k =>
+        `<option ${k === ed.lattice.lattice ? "selected" : ""}>${k}</option>`).join("");
+      body += field("Fill", `<select data-l="lattice">${kinds}</select>`) +
+        `<div data-cellwall class="${["solid", "empty"].includes(ed.lattice.lattice) ? "hidden" : ""}">` +
+        field("Cell, wall mm", `<span class="row"><input data-l="cell" type="number" step="0.5" min="2"><input data-l="wall" type="number" step="0.1" min="0"></span>`) +
+        `</div>` + field("Blend, mm", `<input data-l="blend" type="number" step="1" min="0" title="width of the smooth change into this zone">`);
+    }
+    el.innerHTML = `<div class="zone-head"><select data-shape>${opts}</select>` +
+      (lattice ? `<button class="secondary" data-remove title="remove zone">✕</button>` : "") + `</div>` + body;
+    el.querySelectorAll("[data-v]").forEach(i => { i.value = ed.values[+i.dataset.v] ?? ""; });
+    el.querySelectorAll("[data-l]").forEach(i => { i.value = ed.lattice[i.dataset.l]; });
+    el.querySelector("[data-shape]").onchange = e => { ed.shape = e.target.value; ed.values = zoneDefaults(ed.shape); render(); drawZones(); };
+    el.querySelector("[data-remove]")?.addEventListener("click", () => { el.remove(); onRemove?.(ed); drawZones(); schedulePreview(); });
+  }
+  el.addEventListener("input", e => {
+    const t = e.target;
+    if (t.dataset.v != null) ed.values[+t.dataset.v] = ed.shape === "where" ? t.value : parseFloat(t.value);
+    if (t.dataset.l != null) ed.lattice[t.dataset.l] = t.dataset.l === "lattice" ? t.value : parseFloat(t.value);
+    if (t.dataset.l === "lattice") el.querySelector("[data-cellwall]").classList.toggle("hidden", ["solid", "empty"].includes(t.value));
+    drawZones();
+  });
+  ed.get = () => {
+    const v = ed.values, z = { above: { where: `z - ${v[0]}` }, below: { where: `${v[0]} - z` },
+      sphere: { sphere: v.slice(0, 4) }, box: { box: v.slice(0, 6) }, where: { where: String(v[0]) } }[ed.shape];
+    if (lattice) {
+      const l = ed.lattice;
+      Object.assign(z, { lattice: l.lattice, blend: l.blend });
+      if (!["solid", "empty"].includes(l.lattice)) Object.assign(z, { cell: l.cell, wall_min: l.wall });
+    }
+    return z;
+  };
+  render();
+  return ed;
+}
+
+$("add-zone").onclick = () => {
+  zones.push(zoneEditor($("zones"), { lattice: true, onRemove: ed => { zones = zones.filter(z => z !== ed); } }));
+  drawZones(); schedulePreview();
+};
+
+function simulation() {
+  const f = ["fx", "fy", "fz"].map(k => parseFloat($(k).value) || 0);
+  return { material: $("material").value, fixed: [fixedZone.get()], loads: [{ ...loadZone.get(), force: f }] };
+}
+const topoSettings = () => ({ volume_fraction: (parseFloat($("keep").value) || 30) / 100 });
+
 function recipe() {
   const num = k => parseFloat($(k).value);
   const surfaces = [...$("skin_surfaces").querySelectorAll("input:checked")].map(i => i.value);
@@ -205,6 +329,9 @@ function recipe() {
     skin: num("skin"), skin_surfaces: surfaces.includes("all") || !surfaces.length ? ["all"] : surfaces,
     pitch: num("pitch") };
   if (r.grading === "expr") r.grade_expr = $("grade_expr").value;
+  if (r.lattice.startsWith("voronoi")) r.seed = parseInt($("seed").value) || 0;
+  r.regions = zones.map(z => z.get());
+  if (SIM_GRADINGS.includes(r.grading)) { r.simulation = simulation(); if (r.grading === "topopt") r.topopt = topoSettings(); }
   return r;
 }
 
@@ -283,12 +410,20 @@ const mats = {
   ghost: new THREE.MeshStandardMaterial({ color: 0x8aa0c0, transparent: true, opacity: 0.15, depthWrite: false,
                                           side: THREE.DoubleSide, clippingPlanes: clip }),
 };
-const groups = { shell: new THREE.Group(), part: new THREE.Group() };
-scene.add(groups.shell, groups.part);
+const groups = { shell: new THREE.Group(), part: new THREE.Group(), zones: new THREE.Group() };
+scene.add(groups.shell, groups.part, groups.zones);
+mats.zone = new THREE.MeshBasicMaterial({ color: 0xff8a2a, transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide });
+mats.zoneEdge = new THREE.LineBasicMaterial({ color: 0xff8a2a });
+mats.fixed = new THREE.MeshBasicMaterial({ color: 0x3a7bff, transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide });
+mats.fixedEdge = new THREE.LineBasicMaterial({ color: 0x3a7bff });
+mats.load = new THREE.MeshBasicMaterial({ color: 0xe0335a, transparent: true, opacity: 0.2, depthWrite: false, side: THREE.DoubleSide });
+mats.loadEdge = new THREE.LineBasicMaterial({ color: 0xe0335a });
+mats.result = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.6, metalness: 0, clippingPlanes: clip });
 
-function unpack(buf) {
+function unpack(buf, withValues = false) {
   const [nv, nf] = new Uint32Array(buf, 0, 2);
   const g = new THREE.BufferGeometry();
+  if (withValues) g.userData.values = new Float32Array(buf, 8 + nv * 12 + nf * 12, nv);
   g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(buf, 8, nv * 3), 3));
   g.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, 8 + nv * 12, nf * 3), 1));
   g.computeVertexNormals();
@@ -339,7 +474,8 @@ new ResizeObserver(resize).observe(view);
 renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
 
 async function loadShell() {
-  shellId = null; jobId = null;
+  shellId = null; jobId = null; simJob = null;
+  $("result-row").classList.add("hidden"); $("result-view").value = "lattice"; $("legend").classList.add("hidden");
   setGroup(groups.part, null, []); setGroup(groups.shell, null, []);
   $("download").disabled = $("import").disabled = true;
   viewMsg(inOnshape ? "Loading the part from Onshape…" : "Loading the mesh…");
@@ -358,6 +494,8 @@ async function loadShell() {
     shellId = s.id; shellBounds = s.bounds_mm;
     setGroup(groups.shell, unpack(buf), [mats.part, mats.inside]);
     frame(); applyCut(); showGhost();
+    if (fixedZone) { for (const ed of [fixedZone, loadZone]) { ed.values = zoneDefaults(ed.shape); ed.el.querySelectorAll("[data-v]").forEach(i => { i.value = ed.values[+i.dataset.v]; }); } }
+    drawZones();
     const size = shellBounds[1].map((v, i) => Math.round(v - shellBounds[0][i])).join(" × ");
     $("view-info").textContent = `${size} mm` + (s.watertight ? "" : " · not watertight, the lattice may leak");
     viewMsg("");
@@ -399,9 +537,122 @@ async function runPreview() {
   }
 }
 
+// ---- zones in the view -----------------------------------------------------
+
+function zoneObject(z, fill, edge) {
+  const [lo, hi] = bounds(), pad = 5;
+  let geo, pos = new THREE.Vector3();
+  if (z.sphere) { geo = new THREE.SphereGeometry(Math.max(z.sphere[3], 0.1), 32, 16); pos.set(...z.sphere.slice(0, 3)); }
+  else if (z.box) {
+    const a = z.box.slice(0, 3), b = z.box.slice(3, 6);
+    geo = new THREE.BoxGeometry(...a.map((v, i) => Math.abs(b[i] - v) || 0.1));
+    pos.set(...a.map((v, i) => (v + b[i]) / 2));
+  } else {
+    const m = /^z - (-?[\d.]+)$/.exec(z.where) || /^(-?[\d.]+) - z$/.exec(z.where);
+    if (!m) return null;  // a free-form expression has no simple shape to draw
+    const h = +m[1], above = z.where.startsWith("z"), top = above ? hi[2] + pad : h, bot = above ? h : lo[2] - pad;
+    geo = new THREE.BoxGeometry(hi[0] - lo[0] + 2 * pad, hi[1] - lo[1] + 2 * pad, Math.max(top - bot, 0.1));
+    pos.set((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (top + bot) / 2);
+  }
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(geo, fill), new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), edge));
+  g.position.copy(pos);
+  return g;
+}
+
+function drawZones() {
+  for (const o of groups.zones.children) o.traverse(c => c.geometry?.dispose());
+  groups.zones.clear();
+  if (!$("show-zones").checked) return;
+  const add = (z, f, e) => { try { const o = zoneObject(z, f, e); if (o) groups.zones.add(o); } catch {} };
+  for (const ed of zones) add(ed.get(), mats.zone, mats.zoneEdge);
+  if (fixedZone) add(fixedZone.get(), mats.fixed, mats.fixedEdge);
+  if (loadZone) add(loadZone.get(), mats.load, mats.loadEdge);
+}
+$("show-zones").onchange = drawZones;
+
+// ---- simulation ------------------------------------------------------------
+// Results come back as the mesh plus one value per vertex, coloured blue
+// (lowest) to red (highest) like nTop's static analysis view.
+
+const RAMP = [[0.19, 0.07, 0.48], [0.13, 0.4, 0.9], [0.1, 0.75, 0.85], [0.35, 0.85, 0.3], [0.98, 0.85, 0.15], [0.85, 0.12, 0.1]];
+function ramp(t) {
+  t = Math.min(Math.max(t, 0), 1) * (RAMP.length - 1);
+  const i = Math.min(Math.floor(t), RAMP.length - 2), f = t - i;
+  return RAMP[i].map((v, k) => v + (RAMP[i + 1][k] - v) * f);
+}
+$("legend").querySelector(".bar").style.background =
+  `linear-gradient(to top, ${RAMP.map(c => `rgb(${c.map(v => Math.round(v * 255)).join(",")})`).join(",")})`;
+
+let simJob = null;
+async function showResult() {
+  const what = $("result-view").value;
+  $("legend").classList.toggle("hidden", what === "lattice" || !simJob);
+  if (what === "lattice" || !simJob) { schedulePreview(0); return; }
+  viewMsg("Loading the result…");
+  try {
+    const buf = await (await api(`/api/sims/${simJob.id}/mesh?field=${what}`, { raw: true })).arrayBuffer();
+    const g = unpack(buf, true), v = g.userData.values;
+    // Colour to the 99th percentile so one hot spot doesn't wash out the rest.
+    const sorted = Float32Array.from(v).sort(), top = sorted[Math.floor(0.99 * (sorted.length - 1))] || 1;
+    const col = new Float32Array(v.length * 3);
+    v.forEach((x, i) => col.set(ramp(x / top), 3 * i));
+    g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    setGroup(groups.part, g, [mats.result, mats.inside]);
+    showGhost();
+    const unit = what === "displacement" ? "mm" : "MPa", fmt = x => x.toPrecision(3);
+    $("legend").querySelector(".ticks").innerHTML = [1, 0.75, 0.5, 0.25, 0].map(t =>
+      `<span>${fmt(top * t)}${t === 1 ? (v.some(x => x > top) ? "+" : "") + " " + unit : ""}</span>`).join("");
+    const r = simJob.report;
+    $("view-info").textContent = `${what === "displacement" ? "Displacement" : "Von Mises stress"}: ` +
+      `max ${fmt(what === "displacement" ? r.max_displacement_mm : r.max_stress_mpa)} ${unit} · ` +
+      `${r.elements.toLocaleString()} elements of ${r.element_mm} mm`;
+    viewMsg("");
+  } catch (e) { viewMsg("Could not load the result: " + e.message); }
+}
+$("result-view").onchange = showResult;
+
+async function runSimulation(mode) {
+  if (!shellId) { say("Load a part first.", "bad"); return; }
+  for (const b of ["analyze", "optimize"]) $(b).disabled = true;
+  $("sim-download").disabled = $("sim-import").disabled = true;
+  say(mode === "topopt" ? "Optimising… this takes a few minutes." : "Running the analysis…");
+  try {
+    simJob = await api(`/api/shells/${shellId}/simulate`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ simulation: simulation(), mode, topopt: topoSettings() }) });
+    while (simJob.status === "queued" || simJob.status === "running") {
+      await new Promise(r => setTimeout(r, 1500));
+      simJob = await api(`/api/jobs/${simJob.id}`);
+      say(`${simJob.status}…\n` + simJob.log.slice(-3).join("\n"));
+    }
+    if (simJob.status === "failed") throw new Error(simJob.error);
+    const r = simJob.report;
+    say(`Max displacement ${r.max_displacement_mm.toPrecision(3)} mm, max stress ${r.max_stress_mpa.toPrecision(3)} MPa` +
+        (mode === "topopt" ? `, kept ${Math.round(r.volume_fraction * 100)}% of the material.` : ".") +
+        ` Set Grading to "${mode === "topopt" ? "topopt" : "stress"}" to drive the walls with it.`, "ok");
+    $("result-row").classList.remove("hidden");
+    $("result-view").value = "displacement";
+    $("sim-download").classList.toggle("hidden", mode !== "topopt");
+    $("sim-import").classList.toggle("hidden", mode !== "topopt" || !inOnshape);
+    $("sim-download").disabled = $("sim-import").disabled = mode !== "topopt";
+    showResult();
+  } catch (e) { say(e.message, "bad"); }
+  for (const b of ["analyze", "optimize"]) $(b).disabled = false;
+}
+$("analyze").onclick = () => runSimulation("analysis");
+$("optimize").onclick = () => runSimulation("topopt");
+$("sim-download").onclick = () => { location.href = `/api/jobs/${simJob.id}/result.3mf`; };
+$("sim-import").onclick = async () => {
+  $("sim-import").disabled = true; say("Importing into Onshape…");
+  try { await api(`/api/jobs/${simJob.id}/import`, { method: "POST" }); say("Imported. Look for the new tab in this document.", "ok"); }
+  catch (e) { say("Import failed: " + e.message, "bad"); $("sim-import").disabled = false; }
+};
+
 // Any settings change re-runs the preview.
 for (const ev of ["input", "change"]) $("form-col").addEventListener(ev, e => {
   if (e.target.closest("#source")) return;  // a new part reloads the shell instead
+  if (e.target.closest("#sim-box")) { drawZones(); if (!SIM_GRADINGS.includes($("grading").value)) return; }
+  if ($("result-view").value !== "lattice") { $("result-view").value = "lattice"; $("legend").classList.add("hidden"); }
   if (ev === "input" && e.target.type === "number" && !e.target.validity.valid) return;
   schedulePreview();
 });

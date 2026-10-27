@@ -15,7 +15,7 @@ import uuid
 import numpy as np
 import trimesh
 
-from lattice_helmet.build import LatticeSpec, preview
+from lattice_helmet.build import SIM_GRADINGS, LatticeSpec, preview, sim_key
 
 
 @dataclass
@@ -74,6 +74,11 @@ class ShellStore:
         """Run a preview; raises Superseded if a newer one for this shell came in
         first, so a burst of slider changes only computes the last one."""
         spec = LatticeSpec.from_dict(recipe, log=lambda *a: None)
+        if spec.grading in SIM_GRADINGS and sim_key(spec) not in shell.cache:
+            # An analysis takes seconds and an optimisation minutes: too long
+            # to hold up the live view, so the panel runs them as jobs first.
+            what = "Run analysis" if spec.grading == "stress" else "Optimise shape"
+            raise ValueError(f"press {what} under Simulation first; the preview then uses its result")
         with self.lock:
             n = self.latest.get(shell.id, 0) + 1
             self.latest[shell.id] = n

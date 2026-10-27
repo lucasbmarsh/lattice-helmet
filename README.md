@@ -35,7 +35,7 @@ The helmet is assumed to sit crown up (+z) with the rim at its lowest point; pas
 
 | option | meaning |
 |---|---|
-| `--lattice` | sheet TPMS `gyroid`, `diamond`, `schwarz_p`, `neovius`; solid TPMS `<name>_network`; struts `sc`, `bcc`, `fcc`, `octet`; `custom` with `--graph segments.json` |
+| `--lattice` | sheet TPMS `gyroid`, `diamond`, `schwarz_p`, `neovius`; solid TPMS `<name>_network`; struts `sc`, `bcc`, `fcc`, `octet`; `custom` with `--graph segments.json`; honeycombs `honeycomb_tri`, `honeycomb_hex` (walls extruded through the shell under the conformal map); random foams `voronoi` (struts) and `voronoi_surface` (closed cells), with `seed` and `jitter` in a recipe |
 | `--cell` | unit cell size, mm |
 | `--cell-map` | `rectangular`, `cylindrical`, `spherical`, `conformal` (layers follow the shell, a whole number of cells through its thickness; `--layers` to force) |
 | `--wall`, `--wall-max` | wall/strut thickness where the grading field is 0 and 1. For `_network` lattices it is the offset from the minimal surface (0 = 50% solid) |
@@ -48,6 +48,39 @@ The helmet is assumed to sit crown up (+z) with the rim at its lowest point; pas
 | `--pitch` | voxel size, mm. Keep it at or below half the sheet wall, a quarter of the strut diameter |
 | `--decimate` | fraction of triangles to remove after meshing |
 | `--recipe`, `--save-recipe` | load / write the full spec as JSON |
+
+Recipes can also hold `regions`, `simulation` and `topopt` (no command-line
+flags for these yet):
+
+```json
+{
+  "lattice": "gyroid", "cell_map": "conformal",
+  "regions": [
+    {"name": "crown", "sphere": [0, 0, 125, 45], "lattice": "voronoi", "cell": 8, "wall_min": 1.2, "blend": 6},
+    {"name": "strap mount", "box": [-110, -10, 0, -95, 10, 20], "lattice": "solid"},
+    {"name": "brow", "where": "-y - 90", "lattice": "honeycomb_hex"}
+  ],
+  "grading": "stress", "wall_min": 0.6, "wall_max": 1.8,
+  "simulation": {"material": "PETG",
+                 "fixed": [{"where": "15 - z"}],
+                 "loads": [{"sphere": [0, 0, 125, 40], "force": [0, 0, -500]}]}
+}
+```
+
+A region picks its zone with one of `box` (two corners), `sphere`
+(centre and radius) or `where` (an expression that is positive inside, in mm),
+and overrides any of `lattice cell graph seed jitter cell_map pole layers
+wall_min wall_max grading grade_*` there. `lattice` can also be `solid` or
+`empty`. `blend` (mm, default 4) is the width of the smooth change into the
+zone; later regions win where they overlap.
+
+`simulation` runs a static linear-elastic analysis of the shell (`fea.py`):
+`fixed` zones are held, each load's `force` (N) is spread over the surface in
+its zone. `material` is one of `PLA PETG "Nylon PA12" "TPU 95A" "Resin (tough)"
+Aluminium`, or give `E` (MPa) and `nu`. Grading `stress` then thickens walls
+where von Mises stress is high; grading `topopt` runs a minimum-compliance
+topology optimisation (`topopt`: `volume_fraction`, `iterations`, `keep`
+zones) and thickens walls where the optimiser keeps material.
 
 `custom` graphs are a JSON list of `[[x0, y0, z0], [x1, y1, z1]]` segments in
 unit-cell coordinates (0 to 1).
@@ -70,7 +103,24 @@ shells, volumes and relative density.
 4. `build.py` combines them as `max(shell, smooth_min(skin, lattice))` and runs
    marching cubes in z-slabs that overlap by one slice so they stitch exactly.
 
+5. `fea.py` voxelises the part into cube elements (stiffness scaled by how
+   full each one is, `E * density^2`, so a latticed part is analysed as a
+   homogenised material), solves with algebraic multigrid (pyamg), and runs
+   SIMP topology optimisation with a density filter and optimality-criteria
+   updates.
+
 ## Known limits
+
+- The analysis is linear and static, on 2 to 3 mm elements for a helmet
+  (80,000 by default; set `voxel` for finer). It is good for comparing
+  designs and finding where load goes, not for certifying impact
+  performance, which is non-linear and dynamic. Point-like loads show a
+  spike under the load; the panel colours to the 99th percentile.
+- Topology optimisation solves once per step, about 30 steps of 5 to 10 s on
+  30,000 elements, so a few minutes.
+- Voronoi struts are about twice as slow as a TPMS (3 minutes for a helmet at
+  0.6 mm). The foam is not seamless under the cylindrical and spherical maps
+  (it is under rectangular and conformal).
 
 - The shell SDF is accurate to about half a voxel at the surface; the lattice
   itself is analytic and smooth.
