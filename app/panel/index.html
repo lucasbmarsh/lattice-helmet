@@ -27,6 +27,11 @@
 <body>
 <h1>Lattice helmet</h1>
 
+<div id="signin" class="hidden" style="margin-bottom:10px">
+  <p style="margin:0 0 6px">Sign in so the panel can read this Part Studio and add the result to it.</p>
+  <button id="signin-btn">Sign in with Onshape</button>
+</div>
+
 <fieldset id="source">
   <legend>Shell</legend>
   <label id="part-row">Part <select id="part"></select></label>
@@ -74,11 +79,57 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;",
 function say(text, cls) { const s = $("status"); s.textContent = text; s.className = cls || ""; }
 function fill(sel, items, value) { $(sel).innerHTML = items.map(v => `<option>${v}</option>`).join(""); if (value != null) $(sel).value = value; }
 
-async function api(path, opts) {
-  const r = await fetch(path, opts);
+// OAuth tokens, when the service uses them (options.auth === "oauth"). Kept in
+// localStorage so the panel stays signed in; storage can be blocked in an
+// iframe, so fall back to memory.
+let authMode = "server", tokens = null;
+const store = {
+  get() { try { return JSON.parse(localStorage.getItem("lattice-tokens")); } catch { return tokens; } },
+  set(t) { tokens = t; try { t ? localStorage.setItem("lattice-tokens", JSON.stringify(t)) : localStorage.removeItem("lattice-tokens"); } catch {} },
+};
+
+async function refreshTokens() {
+  if (!tokens?.refresh_token) return false;
+  const r = await fetch("/oauth/refresh", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: tokens.refresh_token }) });
+  if (!r.ok) { store.set(null); return false; }
+  store.set(await r.json()); return true;
+}
+
+class SignInNeeded extends Error {}
+
+async function api(path, opts = {}, retried = false) {
+  const headers = { ...(opts.headers || {}) };
+  if (authMode === "oauth") {
+    if (!tokens) throw new SignInNeeded("sign in with Onshape first");
+    if (!retried && tokens.expires_at < Date.now() / 1000 + 60) await refreshTokens();
+    if (tokens) headers.Authorization = "Bearer " + tokens.access_token;
+  }
+  const r = await fetch(path, { ...opts, headers });
+  if (r.status === 401 && authMode === "oauth" && !retried && await refreshTokens()) return api(path, opts, true);
+  if (r.status === 401 && authMode === "oauth") { store.set(null); showSignIn(true); throw new SignInNeeded("sign in with Onshape again"); }
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
   return r.json();
 }
+
+function showSignIn(on) { $("signin").classList.toggle("hidden", !on); $("run").disabled = on; }
+
+$("signin-btn").onclick = () => {
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  const state = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  // Open synchronously on the click so the popup isn't blocked.
+  const popup = window.open(`/oauth/login?state=${state}`, "onshape-signin", "width=520,height=680");
+  if (!popup) { say("Allow pop-ups for this panel, then try again.", "bad"); return; }
+  say("Waiting for Onshape sign-in…");
+  const started = Date.now();
+  (async function wait() {
+    const r = await fetch("/oauth/poll", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state }) }).catch(() => null);
+    if (r?.status === 200) { store.set(await r.json()); showSignIn(false); say("Signed in.", "ok"); loadParts(); return; }
+    if (r?.status === 202 && Date.now() - started < 5 * 60e3) { setTimeout(wait, 1000); return; }
+    say("Sign-in didn't finish. Try again.", "bad");
+  })();
+};
 
 async function init() {
   const o = await api("/api/options"), d = o.defaults;
@@ -89,17 +140,25 @@ async function init() {
     `<label><input type="checkbox" value="${s}" ${s === "all" ? "checked" : ""}>${s}</label>`).join("");
   $("grading").onchange = () => $("expr-row").classList.toggle("hidden", $("grading").value !== "expr");
 
+  authMode = o.auth || "server";
+  if (authMode === "oauth") { tokens = store.get(); if (!tokens) showSignIn(true); }
+
   if (inOnshape) {
     $("import").classList.remove("hidden");
-    try {
-      const parts = await api(`/api/parts?did=${doc.did}&wvm=${doc.wvm}&wvmid=${doc.wvmid}&eid=${doc.eid}`);
-      $("part").innerHTML = parts.map(p => `<option value="${esc(p.partId)}">${esc(p.name)}</option>`).join("");
-      if (!parts.length) say("This Part Studio has no parts.", "bad");
-    } catch (e) { say("Could not list parts: " + e.message, "bad"); }
+    if (tokens || authMode !== "oauth") await loadParts();
   } else {
     $("part-row").classList.add("hidden"); $("file-row").classList.remove("hidden");
     say("Not opened from Onshape: upload a shell mesh instead.");
   }
+}
+
+async function loadParts() {
+  if (!inOnshape) return;
+  try {
+    const parts = await api(`/api/parts?did=${doc.did}&wvm=${doc.wvm}&wvmid=${doc.wvmid}&eid=${doc.eid}`);
+    $("part").innerHTML = parts.map(p => `<option value="${esc(p.partId)}">${esc(p.name)}</option>`).join("");
+    if (!parts.length) say("This Part Studio has no parts.", "bad");
+  } catch (e) { say((e instanceof SignInNeeded ? "" : "Could not list parts: ") + e.message, "bad"); }
 }
 
 function recipe() {
