@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lattice helmet</title>
 <style>
-  :root { --bg: #fff; --fg: #1d1d1f; --muted: #6b6b70; --line: #d8d8dc; --accent: #2f6fde; --bad: #c0392b; --ok: #2e8b57; }
-  @media (prefers-color-scheme: dark) { :root { --bg: #1e1e20; --fg: #ececf0; --muted: #a0a0a8; --line: #3a3a3f; --accent: #6c9cff; --bad: #ff7b6b; --ok: #5fd08d; } }
+  :root { --view: #f3f4f7; --bg: #fff; --fg: #1d1d1f; --muted: #6b6b70; --line: #d8d8dc; --accent: #2f6fde; --bad: #c0392b; --ok: #2e8b57; }
+  @media (prefers-color-scheme: dark) { :root { --view: #151517; --bg: #1e1e20; --fg: #ececf0; --muted: #a0a0a8; --line: #3a3a3f; --accent: #6c9cff; --bad: #ff7b6b; --ok: #5fd08d; } }
   * { box-sizing: border-box; }
   body { margin: 0; padding: 12px; font: 13px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
   h1 { font-size: 15px; margin: 0 0 8px; }
@@ -22,9 +22,23 @@
   #status { margin-top: 8px; white-space: pre-wrap; color: var(--muted); max-height: 160px; overflow: auto; }
   .bad { color: var(--bad) !important; } .ok { color: var(--ok) !important; }
   .hidden { display: none; }
+  #layout { display: grid; gap: 12px; }
+  @media (min-width: 760px) { #layout { grid-template-columns: 340px 1fr; } #view-col { position: sticky; top: 12px; height: calc(100vh - 24px); } }
+  #view-col { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+  /* Narrow (the Onshape side panel): keep the view pinned on top while the settings scroll. */
+  @media (max-width: 759px) { #view-col { order: -1; position: sticky; top: 0; z-index: 1; background: var(--bg); padding: 0 0 6px; } #viewer { flex: none; height: 280px; min-height: 0; } }
+  #viewer { position: relative; flex: 1; min-height: 300px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--view); }
+  #viewer canvas { display: block; width: 100%; height: 100%; }
+  #view-msg { position: absolute; left: 8px; top: 6px; right: 8px; color: var(--muted); pointer-events: none; }
+  #view-info { position: absolute; left: 8px; bottom: 6px; color: var(--muted); pointer-events: none; font-size: 12px; }
+  #view-tools { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center; }
+  #view-tools select { width: auto; } #view-tools input[type=range] { padding: 0; }
+  #view-tools .checks { grid-column: 1 / -1; }
 </style>
 </head>
 <body>
+<div id="layout">
+<div id="form-col">
 <h1>Lattice helmet</h1>
 
 <div id="signin" class="hidden" style="margin-bottom:10px">
@@ -61,8 +75,29 @@
   <button id="import" class="secondary hidden" disabled>Import into Onshape</button>
 </div>
 <div id="status"></div>
+</div>
 
-<script>
+<div id="view-col">
+  <div id="viewer"><div id="view-msg">Load a part to see it here.</div><div id="view-info"></div></div>
+  <div id="view-tools">
+    Section <input id="cut" type="range" min="0" max="1000" value="1000" title="slide to cut the part open">
+    <select id="cut-axis"><option value="0">X</option><option value="1" selected>Y</option><option value="2">Z</option></select>
+    <div class="checks">
+      <label><input id="live" type="checkbox" checked>Live preview</label>
+      <label><input id="ghost" type="checkbox" checked>Show shell</label>
+      <label>Detail <select id="detail"><option value="0.5">coarse</option><option value="1" selected>normal</option><option value="3">fine</option></select></label>
+    </div>
+  </div>
+</div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "./vendor/OrbitControls.js";  // three.js r160, MIT
+
 const $ = id => document.getElementById(id);
 const q = new URLSearchParams(location.search);
 // Onshape fills these from the extension URL template.
@@ -108,8 +143,8 @@ async function api(path, opts = {}, retried = false) {
   const r = await fetch(path, { ...opts, headers });
   if (r.status === 401 && authMode === "oauth" && !retried && await refreshTokens()) return api(path, opts, true);
   if (r.status === 401 && authMode === "oauth") { store.set(null); showSignIn(true); throw new SignInNeeded("sign in with Onshape again"); }
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
-  return r.json();
+  if (!r.ok) { const e = new Error((await r.json().catch(() => ({}))).detail || r.statusText); e.status = r.status; throw e; }
+  return opts.raw ? r : r.json();
 }
 
 function showSignIn(on) { $("signin").classList.toggle("hidden", !on); $("run").disabled = on; }
@@ -157,8 +192,9 @@ async function loadParts() {
   try {
     const parts = await api(`/api/parts?did=${doc.did}&wvm=${doc.wvm}&wvmid=${doc.wvmid}&eid=${doc.eid}`);
     $("part").innerHTML = parts.map(p => `<option value="${esc(p.partId)}">${esc(p.name)}</option>`).join("");
-    if (!parts.length) say("This Part Studio has no parts.", "bad");
-  } catch (e) { say((e instanceof SignInNeeded ? "" : "Could not list parts: ") + e.message, "bad"); }
+    if (!parts.length) { say("This Part Studio has no parts.", "bad"); return; }
+  } catch (e) { say((e instanceof SignInNeeded ? "" : "Could not list parts: ") + e.message, "bad"); return; }
+  await loadShell();
 }
 
 function recipe() {
@@ -177,7 +213,10 @@ $("run").onclick = async () => {
   say("Starting…");
   try {
     let job;
-    if (inOnshape) {
+    if (shellId) {
+      job = await api(`/api/shells/${shellId}/build`, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ recipe: recipe() }) });
+    } else if (inOnshape) {
       job = await api("/api/jobs/onshape", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...doc, part_id: $("part").value, recipe: recipe() }) });
     } else {
@@ -211,6 +250,158 @@ $("import").onclick = async () => {
   try { await api(`/api/jobs/${jobId}/import`, { method: "POST" }); say("Imported. Look for the new tab in this document.", "ok"); }
   catch (e) { say("Import failed: " + e.message, "bad"); $("import").disabled = false; }
 };
+
+// ---- 3D view -------------------------------------------------------------
+// The shell shows as soon as it loads; a coarse preview of the lattice part
+// replaces it a second or two after each settings change. The section slider
+// cuts the part open, since a skinned part looks like a plain shell outside.
+
+let shellId = null, shellBounds = null;
+const view = $("viewer");
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.localClippingEnabled = true;
+view.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, 1, 1, 10000);
+camera.up.set(0, 0, 1);  // Onshape is Z-up
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x666670, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+camera.add(sun); sun.position.set(0.4, 1, 0.6); scene.add(camera);
+
+const cut = new THREE.Plane(new THREE.Vector3(0, 1, 0), 1e6);
+const clip = [cut];
+const mats = {
+  part: new THREE.MeshStandardMaterial({ color: 0xb8c4d6, roughness: 0.55, metalness: 0.05, clippingPlanes: clip }),
+  // Back faces show through the cut; colour them so the section reads as solid.
+  inside: new THREE.MeshBasicMaterial({ color: 0xe8743b, side: THREE.BackSide, clippingPlanes: clip }),
+  ghost: new THREE.MeshStandardMaterial({ color: 0x8aa0c0, transparent: true, opacity: 0.15, depthWrite: false,
+                                          side: THREE.DoubleSide, clippingPlanes: clip }),
+};
+const groups = { shell: new THREE.Group(), part: new THREE.Group() };
+scene.add(groups.shell, groups.part);
+
+function unpack(buf) {
+  const [nv, nf] = new Uint32Array(buf, 0, 2);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(buf, 8, nv * 3), 3));
+  g.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, 8 + nv * 12, nf * 3), 1));
+  g.computeVertexNormals();
+  return g;
+}
+
+function setGroup(group, geometry, materials) {
+  for (const m of group.children) m.geometry.dispose();
+  group.clear();
+  for (const mat of materials) group.add(new THREE.Mesh(geometry, mat));
+}
+
+function frame() {
+  const [lo, hi] = shellBounds;
+  const c = new THREE.Vector3(...lo).add(new THREE.Vector3(...hi)).multiplyScalar(0.5);
+  const r = new THREE.Vector3(...hi).sub(new THREE.Vector3(...lo)).length() / 2;
+  controls.target.copy(c);
+  camera.position.copy(c).add(new THREE.Vector3(1.2, -2.2, 1.1).normalize().multiplyScalar(r * 3.2));
+  camera.near = r / 50; camera.far = r * 50; camera.updateProjectionMatrix();
+}
+
+function applyCut() {
+  // Slide left to cut away the half nearest the default camera (-X, -Y, -Z side).
+  const axis = +$("cut-axis").value, t = +$("cut").value / 1000;
+  const n = [0, 0, 0]; n[axis] = 1;
+  cut.normal.set(...n);
+  if (!shellBounds || t >= 1) { cut.constant = 1e6; return; }
+  const lo = shellBounds[0][axis], hi = shellBounds[1][axis];
+  cut.constant = -(hi - t * (hi - lo));  // keeps coordinates above the cut
+}
+$("cut").oninput = $("cut-axis").onchange = applyCut;
+
+function showGhost() {
+  // Once the preview is in, the shell becomes a faint outline around it.
+  const hasPart = groups.part.children.length > 0, [outside, inside] = groups.shell.children;
+  groups.shell.visible = !hasPart || $("ghost").checked;
+  if (outside) { outside.material = hasPart ? mats.ghost : mats.part; inside.visible = !hasPart; }
+}
+$("ghost").onchange = showGhost;
+
+function viewMsg(text) { $("view-msg").textContent = text || ""; }
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(view);
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+
+async function loadShell() {
+  shellId = null; jobId = null;
+  setGroup(groups.part, null, []); setGroup(groups.shell, null, []);
+  $("download").disabled = $("import").disabled = true;
+  viewMsg(inOnshape ? "Loading the part from Onshape…" : "Loading the mesh…");
+  try {
+    let s;
+    if (inOnshape) {
+      s = await api("/api/shells/onshape", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...doc, part_id: $("part").value }) });
+    } else {
+      const f = $("file").files[0];
+      if (!f) { viewMsg("Choose a mesh file to see it here."); return; }
+      const body = new FormData(); body.append("file", f);
+      s = await api("/api/shells/upload", { method: "POST", body });
+    }
+    const buf = await (await api(`/api/shells/${s.id}/mesh`, { raw: true })).arrayBuffer();
+    shellId = s.id; shellBounds = s.bounds_mm;
+    setGroup(groups.shell, unpack(buf), [mats.part, mats.inside]);
+    frame(); applyCut(); showGhost();
+    const size = shellBounds[1].map((v, i) => Math.round(v - shellBounds[0][i])).join(" × ");
+    $("view-info").textContent = `${size} mm` + (s.watertight ? "" : " · not watertight, the lattice may leak");
+    viewMsg("");
+    schedulePreview(0);
+  } catch (e) { viewMsg("Could not load the part: " + e.message); }
+}
+$("file").onchange = loadShell;
+$("part").onchange = loadShell;
+
+let previewTimer = null, previewAbort = null;
+function schedulePreview(delay = 350) {
+  if (!shellId || !$("live").checked) return;
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(runPreview, delay);
+}
+
+async function runPreview() {
+  if (!shellId) return;
+  previewAbort?.abort();
+  const ctl = previewAbort = new AbortController(), id = shellId;
+  viewMsg("Updating preview…");
+  try {
+    const r = await api(`/api/shells/${id}/preview`, { method: "POST", signal: ctl.signal, raw: true,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recipe: recipe(), detail: +$("detail").value }) });
+    const buf = await r.arrayBuffer();
+    if (ctl !== previewAbort || id !== shellId) return;  // a newer one is on its way
+    setGroup(groups.part, unpack(buf), [mats.part, mats.inside]);
+    showGhost();
+    const info = JSON.parse(r.headers.get("X-Preview") || "{}");
+    viewMsg("");
+    $("view-info").textContent = `Preview at ${info.pitch} mm voxels, ${info.seconds} s. ` +
+      `Thin walls are drawn thicker than they print; Generate for the real part.`;
+  } catch (e) {
+    if (e.name === "AbortError" || e.status === 409 || ctl !== previewAbort) return;
+    viewMsg("Preview failed: " + e.message);
+  }
+}
+
+// Any settings change re-runs the preview.
+for (const ev of ["input", "change"]) $("form-col").addEventListener(ev, e => {
+  if (e.target.closest("#source")) return;  // a new part reloads the shell instead
+  if (ev === "input" && e.target.type === "number" && !e.target.validity.valid) return;
+  schedulePreview();
+});
+$("live").onchange = () => schedulePreview(0);
+$("detail").onchange = () => schedulePreview(0);
 
 init().catch(e => say(e.message, "bad"));
 </script>
