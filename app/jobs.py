@@ -28,9 +28,11 @@ class Job:
     error: str = None
     created: float = field(default_factory=time.time)
     source: dict = None  # where the shell came from (Onshape ids), if anywhere
+    kind: str = "build"  # build | analysis | topopt
+    data: dict = field(default_factory=dict, repr=False)  # in-memory results (simulation meshes)
 
     def public(self):
-        return {"id": self.id, "status": self.status, "log": self.log[-20:],
+        return {"id": self.id, "kind": self.kind, "status": self.status, "log": self.log[-20:],
                 "report": self.report, "error": self.error, "source": self.source}
 
 
@@ -49,6 +51,25 @@ class JobQueue:
             self.jobs[job.id] = job
         (self.dir / f"{job.id}.json").write_text(spec.to_json())
         self.pool.submit(self._run, job, shell_bytes, recipe, filetype)
+        return job
+
+    def run(self, fn, kind, source=None):
+        """Queue fn(job), which fills job.report (and job.data); same status flow as builds."""
+        job = Job(id=uuid.uuid4().hex[:12], source=source, kind=kind)
+        with self.lock:
+            self.jobs[job.id] = job
+
+        def go():
+            job.status = "running"
+            try:
+                fn(job)
+                job.status = "done"
+            except Exception as e:
+                job.error = f"{type(e).__name__}: {e}"
+                job.log.append(traceback.format_exc(limit=3))
+                job.status = "failed"
+
+        self.pool.submit(go)
         return job
 
     def get(self, job_id):

@@ -18,7 +18,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from lattice_helmet.build import LatticeSpec
+import numpy as np
+
+from lattice_helmet.build import GRADINGS, LatticeSpec, simulate
+from lattice_helmet.fea import MATERIALS, SimSpec, TopoSpec, density_mesh
 from lattice_helmet.fields import lattice_kinds
 from lattice_helmet.maps import MAPS
 
@@ -78,7 +81,7 @@ def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
     def options():
         """What the panel's dropdowns offer, and the default recipe."""
         return {"lattices": lattice_kinds(), "cell_maps": list(MAPS),
-                "gradings": ["uniform", "z", "depth", "point", "expr"],
+                "gradings": list(GRADINGS), "materials": {k: {"E": e, "nu": n} for k, (e, n) in MATERIALS.items()},
                 "skin_surfaces": ["all", "outer", "inner", "rim"],
                 "auth": "oauth" if oauth else "server",
                 "defaults": json.loads(LatticeSpec().to_json())}
@@ -182,6 +185,61 @@ def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
         """The full-resolution build of a loaded shell (same job flow as /api/jobs)."""
         shell = _shell(shell_id)
         return _submit(shell.data, req.recipe, shell.filetype, shell.source)
+
+    # Simulation: a static analysis or a topology optimisation of a loaded
+    # shell. The result lands in the shell's preview cache too, so grading
+    # "stress" or "topopt" with the same settings previews straight away.
+
+    class SimReq(BaseModel):
+        simulation: dict
+        mode: str = "analysis"  # analysis | topopt
+        topopt: dict = None
+
+    @app.post("/api/shells/{shell_id}/simulate")
+    def shell_simulate(shell_id: str, req: SimReq, token=Depends(user_token)):
+        shell = _shell(shell_id)
+        if req.mode not in ("analysis", "topopt"):
+            raise HTTPException(422, "mode must be analysis or topopt")
+        recipe = {"grading": "stress" if req.mode == "analysis" else "topopt",
+                  "simulation": req.simulation, "topopt": req.topopt}
+        try:
+            sim = SimSpec.from_dict(req.simulation)
+            sim.elastic()
+            if not sim.fixed or not sim.loads:
+                raise ValueError("add at least one fixed zone and one load")
+            TopoSpec(**(req.topopt or {}))
+        except (ValueError, TypeError) as e:
+            raise HTTPException(422, str(e))
+
+        def work(job):
+            spec = LatticeSpec.from_dict(recipe, log=job.log.append)
+            _, res, values = simulate(shell.mesh, spec, shell.cache)
+            job.report = dict(res.summary(), mode=req.mode)
+            if req.mode == "analysis":
+                mesh = shell.mesh
+            else:
+                mesh = density_mesh(res, values, shell.mesh)
+                mesh.export(queue.result_path(job.id))
+                job.report["volume_fraction"] = round(float(mesh.volume / shell.mesh.volume), 3)
+            job.data = {"mesh": mesh, "displacement": res.sample(mesh.vertices, "displacement"),
+                        "stress": res.sample(mesh.vertices, "stress")}
+            for k in ("displacement", "stress"):
+                v = job.data[k]
+                job.report[f"{k}_range"] = [float(v.min()), float(v.max())]
+
+        return queue.run(work, req.mode, shell.source).public()
+
+    @app.get("/api/sims/{job_id}/mesh")
+    def sim_mesh(job_id: str, field: str = "displacement"):
+        """The analysed (or optimised) mesh, packed as /mesh, followed by one
+        float32 per vertex: displacement in mm or von Mises stress in MPa."""
+        job = queue.get(job_id)
+        if not job or job.status != "done" or "mesh" not in job.data:
+            raise HTTPException(404, "result not ready")
+        if field not in ("displacement", "stress"):
+            raise HTTPException(422, "field must be displacement or stress")
+        values = np.ascontiguousarray(job.data[field], dtype="<f4")
+        return Response(pack(job.data["mesh"]) + values.tobytes(), media_type="application/octet-stream")
 
     @app.get("/api/jobs/{job_id}")
     def job_status(job_id: str):
