@@ -122,6 +122,7 @@
       <label><input id="show-zones" type="checkbox" checked>Show zones</label>
       <label id="result-row" class="hidden">View <select id="result-view"><option value="lattice">lattice preview</option><option value="displacement">displacement</option><option value="stress">stress</option></select></label>
       <label>Detail <select id="detail"><option value="0.5">coarse</option><option value="1" selected>normal</option><option value="3">fine</option></select></label>
+      <button id="fit-view" class="secondary small" title="Centre the part in the view (or double-click the view)">Fit view</button>
     </div>
   </div>
 </div>
@@ -487,6 +488,7 @@ function applyCut() {
   cut.constant = -(hi - t * (hi - lo));  // keeps coordinates above the cut
 }
 $("cut").oninput = $("cut-axis").onchange = applyCut;
+$("fit-view").onclick = renderer.domElement.ondblclick = () => { if (shellBounds) frame(); };
 
 function showGhost() {
   // Once the preview is in, the shell becomes a faint outline around it.
