@@ -27,6 +27,7 @@ primary_region = "sjc"
     path = "/api/options"
 
 [[vm]]
-  # Lattice builds need a few GB; the 150 MB conformal octet used ~4.
-  size = "shared-cpu-2x"
+  # Lattice builds need a few GB. Dedicated cores run noticeably faster than
+  # shared ones, and the machine only bills while it's awake.
+  size = "performance-2x"
   memory = "4gb"

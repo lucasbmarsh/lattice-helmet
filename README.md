@@ -125,7 +125,7 @@ a time in-process, which suits a single user.
 
 Onshape only loads a panel from a public HTTPS address. The `Dockerfile`
 runs anywhere that runs containers; `fly.toml` is set up for Fly.io with a
-4 GB machine that sleeps when idle. A default build of the test helmet took
+2-core, 4 GB dedicated machine that sleeps when idle. A default build of the test helmet took
 43 s and peaked at 2.3 GB in the container, so 512 MB free tiers are too small.
 
 ```
