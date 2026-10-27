@@ -1,6 +1,6 @@
 """Fill a closed shell mesh with a lattice and mesh the result."""
 
-from dataclasses import asdict, dataclass, field, fields as dc_fields
+from dataclasses import asdict, dataclass, field, fields as dc_fields, replace
 import json
 import time
 
@@ -96,24 +96,45 @@ def _validate(spec):
     return None
 
 
-def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
-    compiled = _validate(spec)
-    if not shell.is_watertight:
-        spec.log("warning: input mesh is not watertight; inside test may leak")
+def _prepare(shell, spec, cache=None):
+    """Grid, shell SDF and surface distances: the part of a build that only
+    depends on the shell, the voxel size and the centre. `cache` (a dict) lets
+    repeated previews of one shell skip it."""
+    margin = 3 * spec.pitch + spec.fillet
+    key = (spec.pitch, margin)
+    if cache is not None and key in cache:
+        grid, sdf = cache[key]
+    else:
+        grid = make_grid(shell, spec.pitch, margin=margin)
+        spec.log(f"grid {grid.shape} at {spec.pitch} mm ({int(np.prod(grid.shape)) / 1e6:.1f} M voxels)")
+        sdf = mesh_sdf(shell, grid)
+        if cache is not None:
+            cache[key] = grid, sdf
+    center = np.asarray(spec.center if spec.center is not None else default_center(shell), dtype=np.float32)
 
+    def surfaces():
+        k = key + (tuple(center.tolist()),)
+        if cache is not None and k in cache:
+            return cache[k]
+        surf = surface_distances(shell, grid, center)
+        if cache is not None:
+            cache[k] = surf
+        return surf
+
+    return grid, sdf, center, surfaces
+
+
+def _chunks(shell, spec, compiled, cache=None):
+    """Mesh the part slab by slab; yields (vertices, faces) per chunk."""
     t0 = time.time()
-    grid = make_grid(shell, spec.pitch, margin=3 * spec.pitch + spec.fillet)
-    nvox = int(np.prod(grid.shape))
-    spec.log(f"grid {grid.shape} at {spec.pitch} mm ({nvox / 1e6:.1f} M voxels)")
-    sdf = mesh_sdf(shell, grid)
+    grid, sdf, center, surfaces = _prepare(shell, spec, cache)
     spec.log(f"shell SDF done in {time.time() - t0:.1f}s")
 
-    center = np.asarray(spec.center if spec.center is not None else default_center(shell), dtype=np.float32)
     aux = {"center": center, "expr": compiled, "shell_t": None}
     surf = None
     need_shell_t = spec.cell_map == "conformal" or (compiled is not None and "shell" in expr.names_used(compiled))
     if need_shell_t or set(spec.skin_surfaces) != {"all"}:
-        surf = surface_distances(shell, grid, center)
+        surf = surfaces()
         spec.log("surfaces: " + ", ".join(f"{k}={'yes' if v is not None else 'none'}" for k, v in surf.items()))
     layers = spec.layers
     if need_shell_t:
@@ -129,8 +150,8 @@ def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
 
     bounds = shell.bounds.astype(np.float32)
     nz = grid.shape[2]
-    pieces = []
     seam = None
+    count = 0
     for k0 in range(0, nz - 1, spec.slab):
         k1 = min(k0 + spec.slab + 1, nz)  # one slice of overlap so chunks stitch
         s = sdf[:, :, k0:k1]
@@ -184,17 +205,31 @@ def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
             continue
         vtx, faces, _, _ = marching_cubes(f, level=0.0, spacing=(spec.pitch,) * 3)
         vtx += grid.origin + np.array([0, 0, k0 * spec.pitch])
-        pieces.append((vtx, faces))
-    spec.log(f"meshed {len(pieces)} chunks in {time.time() - t0:.1f}s")
-    if not pieces:
-        raise ValueError("the lattice came out empty; check cell size and wall thickness")
+        count += 1
+        yield vtx, faces
+    spec.log(f"meshed {count} chunks in {time.time() - t0:.1f}s")
 
+
+def _concat(pieces):
     verts, faces, offset = [], [], 0
     for v, fc in pieces:
         verts.append(v)
         faces.append(fc + offset)
         offset += len(v)
-    out = trimesh.Trimesh(np.vstack(verts), np.vstack(faces), process=False)
+    return np.vstack(verts), np.vstack(faces)
+
+
+def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
+    compiled = _validate(spec)
+    if not shell.is_watertight:
+        spec.log("warning: input mesh is not watertight; inside test may leak")
+
+    t0 = time.time()
+    pieces = list(_chunks(shell, spec, compiled))
+    if not pieces:
+        raise ValueError("the lattice came out empty; check cell size and wall thickness")
+
+    out = trimesh.Trimesh(*_concat(pieces), process=False)
     out.merge_vertices(digits_vertex=6)
     # Drop only faces that collapsed onto a repeated vertex. Removing every
     # zero-area face would also drop slivers whose edges other faces rely on.
@@ -218,6 +253,49 @@ def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
         out.invert()
     spec.log(f"done in {time.time() - t0:.1f}s: {len(out.faces):,} triangles")
     return out
+
+
+def preview(shell, spec, voxels=1.5e6, max_faces=400_000, cache=None):
+    """A quick, coarse version of the part for the panel's live view.
+
+    The voxel size is picked so the grid has about `voxels` samples, and the
+    cleanup passes that make the real build printable are skipped. A wall
+    thinner than a voxel would come out full of holes, so walls and skin are
+    drawn as sqrt(t^2 + voxel^2) thick (struts sqrt(t^2 + (2 voxels)^2), as a
+    thin rod breaks up sooner than a sheet): never too thin to show, and still
+    thicker when the setting is thicker. Pass the same `cache` dict for every
+    preview of one shell to reuse its SDF. Returns (mesh, info).
+    """
+    compiled = _validate(spec)
+    t0 = time.time()
+    size = np.ptp(shell.bounds, axis=0) + 2 * spec.fillet
+    pitch = float(np.cbrt(np.prod(size) / voxels))
+    pitch = max(spec.pitch, np.ceil(pitch * 4) / 4)  # quarter-mm steps, so the cache hits
+
+    one = np.zeros((1, 1, 1), dtype=np.float32)
+    _, (mode, _) = fields.raw_field(spec.lattice, one, one, one, spec.cell, spec.graph)
+    floor = 2 * pitch if mode == "beam" else pitch
+
+    def drawn(t, floor=floor):
+        return float(np.hypot(t, floor))
+
+    quick = replace(spec, pitch=pitch, slab=128, decimate=0,
+                    wall_min=drawn(spec.wall_min), wall_max=drawn(spec.wall_max),
+                    skin=drawn(spec.skin, pitch) if spec.skin > 0 else 0)
+    pieces = list(_chunks(shell, quick, compiled, cache))
+    if not pieces:
+        raise ValueError("the lattice came out empty; check cell size and wall thickness")
+    v, f = _concat(pieces)
+    if len(f) > max_faces:
+        try:
+            import fast_simplification
+
+            v, f = fast_simplification.simplify(v.astype(np.float32), f, agg=10,
+                                                target_reduction=1 - max_faces / len(f))
+        except ImportError:
+            pass
+    info = {"pitch": pitch, "triangles": int(len(f)), "seconds": round(time.time() - t0, 2)}
+    return trimesh.Trimesh(v, f, process=False), info
 
 
 def _components(mesh):

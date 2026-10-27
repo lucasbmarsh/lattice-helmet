@@ -6,7 +6,7 @@ WORKDIR /srv
 
 COPY pyproject.toml README.md ./
 COPY lattice_helmet lattice_helmet
-RUN pip install '.[app]'
+RUN pip install '.[app,decimate]'
 COPY app app
 COPY recipes recipes
 

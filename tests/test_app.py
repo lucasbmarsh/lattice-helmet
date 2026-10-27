@@ -1,4 +1,6 @@
 import io
+import json
+import struct
 import time
 
 import httpx
@@ -85,6 +87,35 @@ def test_upload_and_bad_recipe(client):
     assert _wait(client, ok["id"])["status"] == "done"
 
 
+def _unpack(data):
+    nv, nf = struct.unpack_from("<II", data)
+    assert len(data) == 8 + 12 * nv + 12 * nf
+    return nv, nf
+
+
+def test_live_preview_then_build(client):
+    files = {"file": ("shell.stl", io.BytesIO(_dome_stl()), "model/stl")}
+    s = client.post("/api/shells/upload", files=files).json()
+    assert s["watertight"] and s["bounds_mm"][1][2] == pytest.approx(60, abs=1)
+    assert _unpack(client.get(f"/api/shells/{s['id']}/mesh").content)[1] == s["triangles"]
+
+    r = client.post(f"/api/shells/{s['id']}/preview", json={"recipe": FAST, "detail": 0.25})
+    assert r.status_code == 200 and _unpack(r.content)[1] == json.loads(r.headers["X-Preview"])["triangles"]
+    assert client.post(f"/api/shells/{s['id']}/preview", json={"recipe": {"lattice": "nope"}}).status_code == 422
+    assert client.post("/api/shells/nope/preview", json={}).status_code == 404
+
+    job = client.post(f"/api/shells/{s['id']}/build", json={"recipe": FAST}).json()
+    assert _wait(client, job["id"])["status"] == "done"
+
+
+def test_onshape_shell_keeps_its_source_for_import(client):
+    s = client.post("/api/shells/onshape", json=dict(did="d", wvmid="w1", eid="e", part_id="JHD")).json()
+    assert s["source"]["did"] == "d"
+    job = client.post(f"/api/shells/{s['id']}/build", json={"recipe": FAST}).json()
+    assert _wait(client, job["id"])["status"] == "done"
+    assert client.post(f"/api/jobs/{job['id']}/import").status_code == 200
+
+
 def test_stl_metres_to_mm():
     box = trimesh.creation.box(extents=(0.1, 0.2, 0.3))
     out = _metres_to_mm(box.export(file_type="stl"))
@@ -128,6 +159,7 @@ def test_oauth_sign_in_and_allow_list(oauth_client):
     assert c.get("/api/options").json()["auth"] == "oauth"
     ids = dict(did="d", wvm="w", wvmid="w1", eid="e")
     assert c.get("/api/parts", params=ids).status_code == 401
+    assert c.post("/api/shells/onshape", json=dict(ids, part_id="JHD")).status_code == 401
     assert c.get("/oauth/login", params={"state": "short"}).status_code == 400
 
     tokens = _sign_in(c, "good-code")
