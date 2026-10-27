@@ -214,8 +214,11 @@ $("run").onclick = async () => {
   try {
     let job;
     if (shellId) {
-      job = await api(`/api/shells/${shellId}/build`, { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ recipe: recipe() }) });
+      const build = () => api(`/api/shells/${shellId}/build`, { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ recipe: recipe() }) });
+      // The service forgets loaded parts when it restarts (a hosted machine
+      // sleeps when idle), so load the part again and retry once.
+      job = await build().catch(async e => { if (e.status !== 404) throw e; await loadShell(); return build(); });
     } else if (inOnshape) {
       job = await api("/api/jobs/onshape", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...doc, part_id: $("part").value, recipe: recipe() }) });
@@ -364,7 +367,7 @@ async function loadShell() {
 $("file").onchange = loadShell;
 $("part").onchange = loadShell;
 
-let previewTimer = null, previewAbort = null;
+let previewTimer = null, previewAbort = null, reloaded = false;
 function schedulePreview(delay = 350) {
   if (!shellId || !$("live").checked) return;
   clearTimeout(previewTimer);
@@ -382,6 +385,7 @@ async function runPreview() {
       body: JSON.stringify({ recipe: recipe(), detail: +$("detail").value }) });
     const buf = await r.arrayBuffer();
     if (ctl !== previewAbort || id !== shellId) return;  // a newer one is on its way
+    reloaded = false;
     setGroup(groups.part, unpack(buf), [mats.part, mats.inside]);
     showGhost();
     const info = JSON.parse(r.headers.get("X-Preview") || "{}");
@@ -390,6 +394,7 @@ async function runPreview() {
       `Thin walls are drawn thicker than they print; Generate for the real part.`;
   } catch (e) {
     if (e.name === "AbortError" || e.status === 409 || ctl !== previewAbort) return;
+    if (e.status === 404 && !reloaded) { reloaded = true; return loadShell(); }  // the service restarted
     viewMsg("Preview failed: " + e.message);
   }
 }
