@@ -7,6 +7,7 @@ import trimesh
 from lattice_helmet import LatticeSpec, build, preview
 from lattice_helmet import expr
 from lattice_helmet.fields import GRAPHS, lattice_kinds
+from lattice_helmet.sdf import inside_mask, make_grid
 
 QUIET = dict(log=lambda *a: None)
 
@@ -81,3 +82,78 @@ def test_recipe_round_trip():
 
 def test_all_kinds_listed():
     assert {"gyroid", "gyroid_network", "octet", "custom"} <= set(lattice_kinds())
+
+
+@pytest.mark.parametrize("kind, expect", [
+    # wall length per unit plan area, times 1 mm walls, less the corner
+    # overlaps: triangles 3 / (cell * sqrt(3) / 2) ~ 0.35, hexagons 2 / cell = 0.2
+    ("honeycomb_tri", 0.32), ("honeycomb_hex", 0.18)])
+def test_honeycomb_wall_fraction(kind, expect):
+    assert _box_fraction(lattice=kind) == pytest.approx(expect, rel=0.12)
+
+
+def test_voronoi_is_one_connected_foam_and_seeded():
+    box = trimesh.creation.box((30, 30, 30))
+    spec = dict(lattice="voronoi", cell=8, wall_min=1.2, wall_max=1.2, skin=0, fillet=0, pitch=0.4, **QUIET)
+    a = build(box, LatticeSpec(**spec))
+    assert a.is_watertight and 0.02 < a.volume / box.volume < 0.2
+    b = build(box, LatticeSpec(**spec, seed=7))
+    assert abs(a.volume - b.volume) > 1e-3 * a.volume  # a different random foam
+    assert _box_fraction(lattice="voronoi_surface", cell=8) > 0.15
+
+
+def test_regions_override_the_lattice_locally():
+    box = trimesh.creation.box((60, 30, 30))
+    base = dict(cell=10, wall_min=1.0, wall_max=1.0, skin=0, fillet=0, pitch=0.5, **QUIET)
+    plain = build(box, LatticeSpec(**base)).volume
+    half_solid = build(box, LatticeSpec(**base, regions=[{"where": "x", "lattice": "solid", "blend": 2}])).volume
+    # the x > 0 half is solid, the other half keeps its gyroid
+    assert half_solid == pytest.approx(box.volume / 2 + plain / 2, rel=0.05)
+    sphere = build(box, LatticeSpec(**base, regions=[{"sphere": [0, 0, 0, 8], "lattice": "empty"}])).volume
+    assert sphere < plain
+    with pytest.raises(ValueError):
+        LatticeSpec(regions=[{"lattice": "solid"}], **QUIET) and build(box, LatticeSpec(regions=[{"lattice": "solid"}], **base))
+
+
+def _cantilever(size=(100, 10, 10)):
+    b = trimesh.creation.box(size)
+    b.apply_translation((size[0] / 2, 0, 0))
+    h = [s / 2 + 1 for s in size]
+    fixed = {"box": [-1, -h[1], -h[2], 0.1, h[1], h[2]]}
+    tip = {"box": [size[0] - 0.1, -h[1], -h[2], size[0] + 1, h[1], h[2]], "force": [0, 0, -10]}
+    return b, {"fixed": [fixed], "loads": [tip], "E": 2000, "nu": 0.3}
+
+
+def test_fea_matches_beam_theory():
+    from lattice_helmet.fea import SimSpec, analyze
+
+    beam, sim = _cantilever()
+    r = analyze(beam, SimSpec.from_dict(dict(sim, voxel=1.25), **QUIET))
+    # tip deflection F L^3 / (3 E I) = 2.0 mm, bending stress at the root 6 F L / (b h^2) = 6 MPa
+    assert r.summary()["max_displacement_mm"] == pytest.approx(2.0, rel=0.05)
+    assert 3.5 < r.summary()["max_stress_mpa"] < 7
+
+
+def test_topopt_keeps_the_volume_and_gets_stiffer():
+    from lattice_helmet.fea import SimSpec, TopoSpec, analyze, density_mesh, topopt
+
+    beam, sim = _cantilever((60, 10, 30))
+    sim = SimSpec.from_dict(dict(sim, voxel=2.5), **QUIET)
+    res, x = topopt(beam, sim, TopoSpec(volume_fraction=0.4, iterations=12))
+    assert x.mean() == pytest.approx(0.4, abs=0.03)
+    # The optimised 40% is stiffer than a uniformly 40%-dense part (E * 0.4^3 under SIMP).
+    full = analyze(beam, sim).compliance
+    assert full < res.compliance < full / 0.4 ** 3
+    part = density_mesh(res, x, beam)
+    assert part.is_watertight and 0.25 < part.volume / beam.volume < 0.55
+
+
+def test_stress_grading_thickens_the_loaded_root():
+    beam, sim = _cantilever((60, 20, 20))
+    spec = dict(cell=6, wall_min=0.3, wall_max=2.0, skin=0, fillet=0, pitch=0.5, grading="stress",
+                simulation=dict(sim, voxel=2.0), **QUIET)
+    part = build(beam, LatticeSpec(**spec))
+    grid = make_grid(part, 0.5)
+    solid = inside_mask(part, grid)
+    x = grid.axis(0)
+    assert solid[x < 15].mean() > 1.5 * solid[x > 45].mean()  # more material near the fixed end

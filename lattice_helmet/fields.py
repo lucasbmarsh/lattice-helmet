@@ -92,16 +92,200 @@ def graph_distance(u, v, w, cell, segments):
     return np.sqrt(best) * c
 
 
+# Honeycombs are 2.5D: walls in the (u, v) plane, extruded along w. Under the
+# conformal map w runs through the shell, so the walls stand normal to the skins
+# like a sandwich-panel core.
+
+_SQ3 = np.float32(np.sqrt(3))
+
+
+def honeycomb_tri(u, v, w, cell):
+    """Distance to the walls of a triangle grid with side `cell`."""
+    h = np.float32(cell) * _SQ3 / 2  # spacing of each family of parallel lines
+    best = None
+    for nu, nv in ((0, 1), (_SQ3 / 2, -0.5), (_SQ3 / 2, 0.5)):
+        t = nu * u + nv * v
+        d = np.abs(t - h * np.round(t / h))
+        best = d if best is None else np.minimum(best, d)
+    return best
+
+
+def honeycomb_hex(u, v, w, cell):
+    """Distance to the walls of a hexagon grid, `cell` across the flats."""
+    a = np.float32(cell) / 2  # apothem
+    # Hexagon centres lie on two rectangular grids offset by half a cell; the
+    # nearer of the two candidates is the centre of the hexagon we are in.
+    px, py = np.float32(cell), np.float32(cell) * _SQ3
+    best = None
+    for ox, oy in ((0, 0), (px / 2, py / 2)):
+        qu = u - ox - px * np.round((u - ox) / px)
+        qv = v - oy - py * np.round((v - oy) / py)
+        # hexagonal norm with flats facing +-u
+        r = np.maximum(np.abs(qu), np.abs(qu) * 0.5 + np.abs(qv) * (_SQ3 / 2))
+        best = r if best is None else np.minimum(best, r)
+    return a - best
+
+
+def _hash3(i, j, k, seed):
+    """Three pseudo-random floats in [0, 1) per integer cell index."""
+    h = (i.astype(np.int64) * 73856093) ^ (j.astype(np.int64) * 19349663) ^ (k.astype(np.int64) * 83492791)
+    h = (h ^ (seed * 2654435761)) & 0xFFFFFFFF
+    out = []
+    for m in (0x9E3779B1, 0x85EBCA77, 0xC2B2AE3D):
+        x = (h * m) & 0xFFFFFFFF
+        x ^= x >> 15
+        x = (x * 0x2C1B3C6D) & 0xFFFFFFFF
+        x ^= x >> 12
+        out.append((x & 0xFFFFFF).astype(np.float32) / np.float32(1 << 24))
+    return out
+
+
+def _voronoi_setup(u, v, w, cell, seed, jitter, margin=1):
+    """Flattened points, their cell indices, and a table of the seed point of
+    every cell in range (one per cell, moved randomly by up to `jitter` of a cell)."""
+    u, v, w = np.broadcast_arrays(u, v, w)
+    pts = [np.ascontiguousarray(a, dtype=np.float32).reshape(-1) for a in (u, v, w)]
+    c = np.float32(cell)
+    cells = [np.floor(a / c).astype(np.int64) for a in pts]
+    lo = [int(a.min()) - margin for a in cells]
+    hi = [int(a.max()) + margin for a in cells]
+    idx = np.meshgrid(*[np.arange(a, b + 1) for a, b in zip(lo, hi)], indexing="ij")
+    r = _hash3(*idx, seed)
+    table = np.stack([(n + 0.5 + jitter * (q - 0.5)) * c for n, q in zip(idx, r)], axis=-1).astype(np.float32)
+    cells = [a - l for a, l in zip(cells, lo)]
+    return u.shape, pts, cells, table
+
+
+_OFFS = [(a, b, d) for a in (-1, 0, 1) for b in (-1, 0, 1) for d in (-1, 0, 1)]
+
+
+def _blocks(pts, cells, table, block):
+    """Per block of points: (slice, points, the 27 candidate seeds, squared distances)."""
+    for s0 in range(0, len(pts[0]), block):
+        sl = slice(s0, s0 + block)
+        p = [a[sl] for a in pts]
+        base = [a[sl] for a in cells]
+        seeds = np.stack([table[base[0] + a, base[1] + b, base[2] + d] for a, b, d in _OFFS])  # (27, n, 3)
+        d2 = sum((p[i] - seeds[:, :, i]) ** 2 for i in range(3))
+        yield sl, p, seeds, d2
+
+
+def voronoi_surface(u, v, w, cell, seed=0, jitter=1.0, block=1 << 18):
+    """Closed-cell foam: distance to the nearest Voronoi face.
+
+    The nearest seed is found among the 27 cells around the point; the
+    distance to the bisector plane between it and each other seed is exact,
+    and the nearest of those planes is the cell's face.
+    """
+    shape, pts, cells, table = _voronoi_setup(u, v, w, cell, seed, jitter)
+    out = np.empty_like(pts[0])
+    for sl, p, seeds, d2 in _blocks(pts, cells, table, block):
+        near = np.argmin(d2, axis=0)
+        s1 = np.take_along_axis(seeds, near[None, :, None], axis=0)[0]
+        e = seeds - s1  # (27, n, 3)
+        ln = np.sqrt((e * e).sum(axis=2))
+        # distance from p to each bisector of s1 and another seed: (|p-s|^2 - |p-s1|^2) / 2|s-s1|
+        f = (d2 - np.take_along_axis(d2, near[None], axis=0)) / np.maximum(2 * ln, 1e-6)
+        f[near, np.arange(len(near))] = np.inf
+        out[sl] = f.min(axis=0)
+    return out.reshape(shape)
+
+
+def voronoi_beam(u, v, w, cell, seed=0, jitter=1.0):
+    """Open-cell foam: struts on the Voronoi edges, where three cells meet.
+
+    The Voronoi diagram of the seeds in range (plus a margin) is built with
+    scipy, its edges are binned into cells, and each point takes the exact
+    distance to the edges listed for its cell. Edges farther than half a cell
+    are never listed, so the result is min(distance, cell / 2), which is
+    still continuous.
+    """
+    from scipy.spatial import Voronoi
+
+    shape, pts, cells, table = _voronoi_setup(u, v, w, cell, seed, jitter, margin=3)
+    c = np.float32(cell)
+    reach = 0.3 * c  # struts up to 0.6 of a cell across
+    vor = Voronoi(table.reshape(-1, 3).astype(np.float64))
+    edges = set()
+    for ridge in vor.ridge_vertices:
+        if -1 in ridge:
+            continue
+        for i, j in zip(ridge, ridge[1:] + ridge[:1]):
+            edges.add((min(i, j), max(i, j)))
+    e = np.array(sorted(edges), dtype=np.int64).reshape(-1, 2)
+    va = vor.vertices.astype(np.float32)
+    # Positions relative to the table origin (cell (0, 0, 0) of the table).
+    origin = (np.array([pts[i].min() for i in range(3)], dtype=np.float32) // c - 3) * c
+    size = np.array(table.shape[:3]) * c
+    A, B = va[e[:, 0]] - origin, va[e[:, 1]] - origin
+    # Keep edges in the trusted middle of the table, away from its margin.
+    inner = np.all((np.minimum(A, B) > c) & (np.maximum(A, B) < size - c), axis=1)
+    A, B = A[inner], B[inner]
+
+    # Bin every edge into each half-cell bin its bounding box, grown by
+    # `reach`, touches.
+    bs = c / 2
+    nb = tuple(int(n) for n in np.ceil(size / bs))
+    lo = np.floor((np.minimum(A, B) - reach) / bs).astype(np.int64).clip(0, np.array(nb) - 1)
+    hi = np.floor((np.maximum(A, B) + reach) / bs).astype(np.int64).clip(0, np.array(nb) - 1)
+    span = hi - lo + 1
+    owner = np.repeat(np.arange(len(A)), span.prod(axis=1))
+    first = np.repeat(np.cumsum(span.prod(axis=1)) - span.prod(axis=1), span.prod(axis=1))
+    r = np.arange(len(owner)) - first  # index within each edge's box of bins
+    sp = span[owner]
+    bi = lo[owner] + np.stack([r // (sp[:, 1] * sp[:, 2]), (r // sp[:, 2]) % sp[:, 1], r % sp[:, 2]], axis=1)
+    flat = np.ravel_multi_index(bi.T, nb)
+    order = np.argsort(flat, kind="stable")
+    flat, owner = flat[order], owner[order]
+    edge_start = np.searchsorted(flat, np.arange(int(np.prod(nb)) + 1))
+
+    # Group the points by bin and measure each group against its own edges.
+    rel = np.stack([pts[i] - origin[i] for i in range(3)], axis=1)
+    bin_of = np.ravel_multi_index([np.clip((rel[:, i] // bs).astype(np.int64), 0, nb[i] - 1)
+                                   for i in range(3)], nb)
+    porder = np.argsort(bin_of, kind="stable")
+    bins, pstart = np.unique(bin_of[porder], return_index=True)
+    pstart = np.append(pstart, len(porder))
+    out = np.full(len(porder), reach, dtype=np.float32)
+    for n, bn in enumerate(bins):
+        ks = owner[edge_start[bn]:edge_start[bn + 1]]
+        if len(ks) == 0:
+            continue
+        idx = porder[pstart[n]:pstart[n + 1]]
+        q = rel[idx][:, None, :] - A[ks][None]  # (m, k, 3)
+        d = (B[ks] - A[ks])[None]
+        t = np.clip((q * d).sum(axis=2) / np.maximum((d * d).sum(axis=2), 1e-12), 0, 1)
+        d2 = ((q - t[..., None] * d) ** 2).sum(axis=2).min(axis=1)
+        out[idx] = np.sqrt(np.minimum(d2, reach * reach))
+    return out.reshape(shape)
+
+
+# Lattices that are not TPMS or strut graphs: name -> (function, mode).
+# Their fields are already close to true distances, so no calibration.
+OTHER = {
+    "honeycomb_tri": (honeycomb_tri, "sheet"),
+    "honeycomb_hex": (honeycomb_hex, "sheet"),
+    "voronoi": (voronoi_beam, "beam"),
+    "voronoi_surface": (voronoi_surface, "sheet"),
+}
+RANDOM = {"voronoi", "voronoi_surface"}
+
+
 def lattice_kinds():
     sheets = sorted(TPMS)
-    return sheets + [f"{s}_network" for s in sheets] + sorted(GRAPHS) + ["custom"]
+    return sheets + [f"{s}_network" for s in sheets] + sorted(GRAPHS) + sorted(OTHER) + ["custom"]
 
 
-def raw_field(kind, u, v, w, cell, graph=None):
+def raw_field(kind, u, v, w, cell, graph=None, seed=0, jitter=1.0):
     """Return (R, (mode, cal)) for a lattice kind.
 
     mode says how R becomes a distance; cal scales the requested wall.
+    seed and jitter only affect the random (Voronoi) lattices.
     """
+    if kind in OTHER:
+        fn, mode = OTHER[kind]
+        kw = dict(seed=seed, jitter=jitter) if kind in RANDOM else {}
+        return fn(u, v, w, cell, **kw), (mode, 1.0)
     if kind in TPMS:
         return TPMS[kind](u, v, w, cell), ("sheet", SHEET_CAL[kind])
     if kind.endswith("_network") and kind[:-8] in TPMS:
