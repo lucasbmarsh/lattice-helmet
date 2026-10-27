@@ -218,3 +218,15 @@ def test_zones_and_new_lattices_in_options(client):
     o = client.get("/api/options").json()
     assert {"voronoi", "honeycomb_tri", "honeycomb_hex"} <= set(o["lattices"])
     assert "stress" in o["gradings"] and "PETG" in o["materials"]
+
+
+def test_tessellated_faces_stitch_into_a_closed_mm_mesh():
+    from app.onshape import _faces_to_stl
+
+    box = trimesh.creation.box((0.02, 0.03, 0.04))  # metres, as Onshape sends them
+    faces = [{"facets": [{"vertices": [{"x": v[0], "y": v[1], "z": v[2]} for v in tri]} for tri in box.triangles[i::3]]}
+             for i in range(3)]  # split over three "faces" to exercise the stitching
+    m = trimesh.load(io.BytesIO(_faces_to_stl({"bodies": [{"faces": faces}]})), file_type="stl")
+    assert m.is_watertight and m.volume == pytest.approx(20 * 30 * 40, rel=1e-6)
+    old = [{"faces": [{"facets": [{"vertices": tri.tolist()} for tri in box.triangles]}]}]  # older API: lists
+    assert trimesh.load(io.BytesIO(_faces_to_stl(old)), file_type="stl").is_watertight
