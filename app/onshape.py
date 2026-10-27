@@ -1,9 +1,10 @@
 """Minimal Onshape REST client.
 
-Uses API keys with HTTP Basic auth for now (ONSHAPE_ACCESS_KEY and
-ONSHAPE_SECRET_KEY). An OAuth bearer token can replace them once the app is
-registered, by passing `token=`. With ONSHAPE_AUTH=proxy no credentials are
-sent, for environments whose egress proxy adds the Authorization header.
+Inside Onshape the service passes each user's OAuth token (`token=`, see
+app/auth.py). Without OAuth it falls back to API keys with HTTP Basic auth
+(ONSHAPE_ACCESS_KEY and ONSHAPE_SECRET_KEY). With ONSHAPE_AUTH=proxy no
+credentials are sent, for environments whose egress proxy adds the
+Authorization header.
 
 list_parts, export_stl and upload_file were checked live against
 cad.onshape.com on 2026-10-26.
@@ -19,7 +20,9 @@ BASE_URL = os.environ.get("ONSHAPE_BASE_URL", "https://cad.onshape.com")
 
 
 class OnshapeError(RuntimeError):
-    pass
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 _STL_FACET = np.dtype([("normal", "<f4", 3), ("v", "<f4", (3, 3)), ("attr", "<u2")])
@@ -53,8 +56,12 @@ class Onshape:
     def _get(self, path, **params):
         r = self.http.get(path, params=params)
         if r.status_code >= 400:
-            raise OnshapeError(f"GET {path} -> {r.status_code}: {r.text[:300]}")
+            raise OnshapeError(f"GET {path} -> {r.status_code}: {r.text[:300]}", r.status_code)
         return r
+
+    def session_info(self):
+        """The signed-in user: {"id", "email", "name", ...}."""
+        return self._get("/api/users/sessioninfo").json()
 
     def list_parts(self, did, wvm, wvmid, eid):
         """Parts in a Part Studio: [{"partId", "name"}, ...]."""
@@ -77,7 +84,7 @@ class Onshape:
                   "stlMode": "BINARY", "grouping": True},
         )
         if r.status_code >= 400:
-            raise OnshapeError(f"STL export -> {r.status_code}: {r.text[:300]}")
+            raise OnshapeError(f"STL export -> {r.status_code}: {r.text[:300]}", r.status_code)
         t = r.json()
         deadline = time.monotonic() + max_wait
         while t.get("requestState") == "ACTIVE":
@@ -90,7 +97,7 @@ class Onshape:
         r = self.http.get(f"/api/documents/d/{did}/externaldata/{t['resultExternalDataIds'][0]}",
                           headers={"Accept": "application/octet-stream"})
         if r.status_code >= 400:
-            raise OnshapeError(f"STL download -> {r.status_code}: {r.text[:300]}")
+            raise OnshapeError(f"STL download -> {r.status_code}: {r.text[:300]}", r.status_code)
         return _metres_to_mm(r.content)
 
     def upload_file(self, did, wid, filename, data, translate=False):
@@ -105,5 +112,5 @@ class Onshape:
             data={"encodedFilename": filename, "translate": str(translate).lower()},
         )
         if r.status_code >= 400:
-            raise OnshapeError(f"upload -> {r.status_code}: {r.text[:300]}")
+            raise OnshapeError(f"upload -> {r.status_code}: {r.text[:300]}", r.status_code)
         return r.json()

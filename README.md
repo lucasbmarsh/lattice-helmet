@@ -116,14 +116,52 @@ into the document.
 | `GET /api/jobs/{id}/result.3mf` | the printable result |
 | `POST /api/jobs/{id}/import` | add the result to the source document |
 
-To show the panel inside Onshape, the service needs a public HTTPS URL. Then,
-in the Onshape Developer Portal, create an OAuth application and add a
-right-panel extension in the Part Studio context whose action URL is
+Run that way, the service uses your API keys for every caller. Inside
+Onshape it should instead act as whoever opened the panel, through an OAuth
+app; setting `ONSHAPE_CLIENT_ID` turns that on (see below). Jobs run one at
+a time in-process, which suits a single user.
+
+### Hosting
+
+Onshape only loads a panel from a public HTTPS address. The `Dockerfile`
+runs anywhere that runs containers; `fly.toml` is set up for Fly.io with a
+4 GB machine that sleeps when idle. A default build of the test helmet took
+43 s and peaked at 2.3 GB in the container, so 512 MB free tiers are too small.
+
+```
+fly launch --copy-config --no-deploy       # pick an app name, e.g. lattice-helmet
+fly secrets set ONSHAPE_CLIENT_ID=... ONSHAPE_CLIENT_SECRET=... \
+    LATTICE_ALLOWED_USERS=you@example.com PUBLIC_URL=https://<app>.fly.dev
+fly deploy
+```
+
+| variable | does |
+|---|---|
+| `ONSHAPE_CLIENT_ID`, `ONSHAPE_CLIENT_SECRET` | the OAuth app's credentials; turn on sign-in |
+| `LATTICE_ALLOWED_USERS` | comma-separated Onshape emails (or user ids) allowed to use the service. Leave it unset and anyone who signs in can run builds on your machine |
+| `PUBLIC_URL` | the service's own address, used for the OAuth redirect URI |
+| `LATTICE_WORKDIR` | where jobs and results go (`/tmp/jobs` in the container, lost on restart) |
+
+### Onshape OAuth app
+
+In the [Developer Portal](https://dev-portal.onshape.com), under OAuth
+applications, create an application:
+
+- Type: integrated cloud app. Redirect URL: `https://<your host>/oauth/callback`.
+  OAuth URL: `https://<your host>/panel/`.
+- Permissions: read your profile, read your documents, write to your
+  documents (the import adds a tab to the document).
+- Copy the client id and secret (the secret is shown once) into the secrets above.
+
+Then, on the app's Extensions tab, add an extension with location "Element
+right panel", the Part Studio context, and action URL
 
 ```
 https://<your host>/panel/?documentId={$documentId}&workspaceId={$workspaceId}&elementId={$elementId}
 ```
 
-The Onshape endpoint paths in `app/onshape.py` have not been run against
-cad.onshape.com yet; the tests use a fake Onshape client. Jobs run one at a
-time in-process, which suits a single user.
+Open a Part Studio and the app's icon appears in the right-hand panel bar.
+If it doesn't, create a private store entry for the app and subscribe to it.
+The first time, the panel shows "Sign in with Onshape", which opens Onshape's
+consent page in a pop-up; after that the panel keeps the token and refreshes
+it itself.

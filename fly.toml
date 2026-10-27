@@ -1,0 +1,32 @@
+# Fly.io config. `fly launch --copy-config --no-deploy` picks a unique app
+# name; see README "Hosting" for the secrets to set before `fly deploy`.
+app = "lattice-helmet"
+primary_region = "sjc"
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Sleep when idle and wake on the next request. The panel polls while a
+  # build runs, which keeps the machine up until it finishes.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50
+
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/api/options"
+
+[[vm]]
+  # Lattice builds need a few GB; the 150 MB conformal octet used ~4.
+  size = "shared-cpu-2x"
+  memory = "4gb"
