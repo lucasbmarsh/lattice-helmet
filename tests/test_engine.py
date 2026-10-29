@@ -204,3 +204,22 @@ def test_edge_zone_makes_a_solid_border():
     # the rim is a 15 mm wide ring of radius 45..60; a 5 mm band is about a third of it in height
     ring = np.pi * (60 ** 2 - 45 ** 2) * 5
     assert banded.volume - plain == pytest.approx(ring * (1 - plain / dome.volume), rel=0.35)
+
+
+def test_cut_edges_of_a_panel_count_as_rim():
+    # A helmet split into panels: a 7 mm spherical shell cut by planes well off
+    # the centre. Every cut face is an edge, whichever way it faces.
+    from lattice_helmet.surfaces import classify_faces, default_center
+
+    shell = trimesh.creation.icosphere(5, radius=100).difference(trimesh.creation.icosphere(5, radius=93))
+    keep = trimesh.creation.box((200, 200, 200))
+    keep.apply_translation((70 - 100, 0, 30 + 100))  # x < 70, z > 30
+    panel = shell.intersection(keep)
+    labels = classify_faces(panel, default_center(panel))
+    p, n = panel.triangles_center, panel.face_normals
+    cut = (np.abs(p[:, 0] - 70) < 1e-3) & (n[:, 0] > 0.99) | (np.abs(p[:, 2] - 30) < 1e-3) & (n[:, 2] < -0.99)
+    assert cut.any() and (labels[cut] == "rim").all()
+    r = np.linalg.norm(p, axis=1)
+    sheet = ~cut & ((r > 99.5) | (r < 93.5))
+    assert (labels[sheet & (r > 99.5)] == "outer").mean() > 0.95  # all but a sliver next to the cuts
+    assert (labels[sheet & (r < 93.5)] == "inner").mean() > 0.95
