@@ -1,8 +1,11 @@
 """Split a helmet shell's surface into outer, inner and rim, and measure
 distance to each on the grid.
 
-A face is "outer" when its normal points away from the helmet centre, "inner"
-when it points toward it, and "rim" otherwise (edges, brow and ear cut-outs).
+A face is part of the shell's two sheets when the shell's other side is right
+behind it (a short way along -normal, facing back at it); of those, it is
+"outer" when its normal points away from the helmet centre and "inner" when it
+points toward it. Every other face is "rim": the edges, brow and ear cut-outs,
+and the cut faces of a helmet split into panels.
 """
 
 import numpy as np
@@ -71,13 +74,55 @@ def default_center(mesh, up=(2, 1)):
     return np.clip(c, lo, hi)
 
 
-def classify_faces(mesh, center, threshold=0.7):
-    d = mesh.triangles_center - center
-    d /= np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
-    dot = np.einsum("ij,ij->i", d, mesh.face_normals)
+def _backside_depth(mesh, pts, normals, step):
+    """How far behind each point (along -normal) the shell's other side is,
+    counting only surface that faces back at it; inf where there is none
+    within reach. Marches each ray in half steps against a random sample of
+    the surface about `step` mm apart."""
+    from scipy.spatial import cKDTree
+
+    sample, fi = trimesh.sample.sample_surface(mesh, int(4 * mesh.area / step**2), seed=0)
+    sn = mesh.face_normals[fi]
+    tree = cKDTree(sample)
+    reach = min(40.0, 0.15 * float(np.linalg.norm(np.ptp(mesh.bounds, axis=0))))
+    depth = np.full(len(pts), np.inf)
+    todo = np.arange(len(pts))
+    for s in np.arange(step / 2, reach, step / 2):
+        if not len(todo):
+            break
+        x = pts[todo] - s * normals[todo]
+        dist, k = tree.query(x, k=8, distance_upper_bound=2 * step)
+        ok = np.isfinite(dist)
+        k = np.where(ok, k, 0)
+        # a nearby sample facing back at the ray, whose tangent plane the ray point is on
+        ok &= np.einsum("ijk,ik->ij", sn[k], normals[todo]) < -0.9
+        ok &= np.abs(np.einsum("ijk,ijk->ij", x[:, None] - sample[k], sn[k])) < step / 2
+        hit = ok.any(axis=1)
+        depth[todo[hit]] = s
+        todo = todo[~hit]
+    return depth
+
+
+def classify_faces(mesh, center, step=None):
+    """'outer', 'inner' or 'rim' for each face (see the module notes)."""
+    area = float(mesh.area)
+    if step is None:
+        step = float(np.clip(np.sqrt(area / 1e5), 0.5, 1.5))
+    n = mesh.face_normals
+    depth = _backside_depth(mesh, mesh.triangles_center, n, step)
+    found = np.isfinite(depth)
     labels = np.full(len(mesh.faces), "rim", dtype=object)
-    labels[dot > threshold] = "outer"
-    labels[dot < -threshold] = "inner"
+    if not found.any():
+        return labels
+    # shell thickness: the area-weighted median depth over the faces that found a backside
+    order = np.argsort(depth[found])
+    w = np.cumsum(mesh.area_faces[found][order])
+    thick = depth[found][order][np.searchsorted(w, w[-1] / 2)]
+    sheet = depth <= 2 * thick + 2 * step
+    d = mesh.triangles_center - center
+    out = np.einsum("ij,ij->i", d, n) > 0
+    labels[sheet & out] = "outer"
+    labels[sheet & ~out] = "inner"
     return labels
 
 
