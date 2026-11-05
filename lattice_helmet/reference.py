@@ -196,7 +196,21 @@ class Reference:
         spacing = self._spacing(seeds)
         if abs(spacing / cell - 1) > 0.02:
             seeds = self._relax(seeds_for(max(4, int(round(n * (spacing / cell) ** 2)))), iterations)
+        seeds = self._even(seeds)
         self._seeds[key] = seeds
+        return seeds
+
+    def _even(self, seeds, iterations=200, rate=0.3):
+        """Push apart neighbours closer than the typical spacing. Lloyd leaves
+        a few tight pairs, and the tightest pair sets how big same-size holes
+        can be."""
+        for _ in range(iterations):
+            d, nb = cKDTree(seeds).query(seeds, k=min(7, len(seeds)))
+            target = np.median(d[:, 1:])
+            v = seeds[:, None] - seeds[nb[:, 1:]]
+            dd = d[:, 1:, None]
+            push = np.clip(target - dd, 0, None) * v / np.maximum(dd, 1e-9)
+            seeds = self.foot(seeds + rate * push.sum(axis=1))
         return seeds
 
     def _relax(self, seeds, iterations):
@@ -215,19 +229,21 @@ class Reference:
         d, _ = cKDTree(seeds).query(seeds, k=4)
         return float(np.median(d[:, 1:]))
 
-    def hex_holes(self, cell, center, up, wall):
+    def hex_holes(self, cell, center, up, wall, same_size=False):
         """fields.HexHoles for the cells: a regular hexagonal hole per cell,
         keeping at least `wall` mm between holes."""
         from .fields import HexHoles
 
-        key = ("holes", round(float(cell), 3), tuple(np.round(center, 2)), tuple(up), round(float(wall), 3))
+        key = ("holes", round(float(cell), 3), tuple(np.round(center, 2)), tuple(up), round(float(wall), 3),
+               same_size)
         if key not in self._seeds:
             seeds = self.hex_seeds(cell, center, up)
             _, i = self.tree.query(seeds)
-            self._seeds[key] = HexHoles(seeds, self.normals[i], wall)
+            self._seeds[key] = HexHoles(seeds, self.normals[i], wall, same_size=same_size)
         return self._seeds[key]
 
-    def hex_field(self, x, y, z, cell, center, up, bounds, mask=None, holes_wall=None, block=1 << 19):
+    def hex_field(self, x, y, z, cell, center, up, bounds, mask=None, holes_wall=None, same_size=False,
+                  block=1 << 19):
         """Distance (mm, on the reference surface) from where each point
         lands on the reference (see `landing`) to the walls between the
         hexagonal cells. Points outside `mask` get `cell` (far from any
@@ -237,7 +253,7 @@ class Reference:
         hole instead (see fields.HexHoles), positive between holes."""
         seeds = self.hex_seeds(cell, center, up)
         tree = cKDTree(seeds)
-        holes = None if holes_wall is None else self.hex_holes(cell, center, up, holes_wall)
+        holes = None if holes_wall is None else self.hex_holes(cell, center, up, holes_wall, same_size)
         x, y, z = np.broadcast_arrays(x, y, z)
         shape = x.shape
         out = np.full(int(np.prod(shape)), np.float32(cell), dtype=np.float32)
@@ -251,7 +267,7 @@ class Reference:
             p = np.stack([xs[idx], ys[idx], zs[idx]], axis=1).astype(np.float64)
             f = self.landing(p, bounds)
             if holes is not None:
-                out[idx] = holes.field(f)
+                out[idx] = holes.field(f, p)
                 continue
             d, nb = tree.query(f, k=k)
             s1 = seeds[nb[:, 0]]

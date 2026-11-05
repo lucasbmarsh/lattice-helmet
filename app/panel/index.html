@@ -91,8 +91,10 @@
   <label>Cell size, mm <input id="cell" type="number" step="0.5" min="2"></label>
   <label>Wall, mm <span class="row"><input id="wall_min" type="number" step="0.1" min="0" title="where grading = 0"><input id="wall_max" type="number" step="0.1" min="0" title="where grading = 1"></span></label>
   <label id="holes-row" class="hidden">Hex holes <select id="hex_holes" title="hexagons can't tile a curved surface exactly; choose what stays even">
-    <option value="regular">perfect hexagons, walls thicken</option><option value="cells">even walls, holes vary</option></select></label>
-  <p id="holes-hint" class="hint hidden">Every hole is a regular hexagon. Walls are the first Wall value where cells are tightest and thicker where there's room.</p>
+    <option value="same">perfect hexagons, all one size</option><option value="regular">perfect hexagons, as big as fits</option>
+    <option value="cells">even walls, holes vary</option></select></label>
+  <p id="holes-hint" class="hint hidden">Every hole is a regular hexagon running straight through the shell. Walls are the
+    first Wall value where cells are tightest and thicker where there's room.</p>
   <label id="seed-row" class="hidden">Random seed <input id="seed" type="number" step="1" value="0" title="change for a different random foam"></label>
   <label>Grading <select id="grading"></select></label>
   <label id="expr-row" class="hidden">Expression <input id="grade_expr" placeholder="smoothstep(0, 90, dist(x, y, z, 0, 0, 125))"></label>
@@ -243,7 +245,7 @@ async function init() {
   $("lattice").onchange = () => {
     $("seed-row").classList.toggle("hidden", !$("lattice").value.startsWith("voronoi"));
     const hex = $("lattice").value === "geodesic_hex";
-    $("holes-row").classList.toggle("hidden", !hex); $("holes-hint").classList.toggle("hidden", !hex || $("hex_holes").value !== "regular");
+    $("holes-row").classList.toggle("hidden", !hex); $("holes-hint").classList.toggle("hidden", !hex || $("hex_holes").value === "cells");
   };
   $("hex_holes").onchange = () => $("lattice").onchange();
   latticeKinds = o.lattices;

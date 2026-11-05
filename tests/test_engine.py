@@ -338,3 +338,19 @@ def test_regular_hex_holes_build_on_a_sphere_and_a_reference():
     even = build(dome, LatticeSpec(**dict(spec, hex_holes="cells")))
     assert a.is_watertight and b.is_watertight
     assert a.volume > even.volume  # walls only thicken from the minimum
+
+
+def test_same_size_holes_are_straight_and_equal():
+    from lattice_helmet.fields import HexHoles, geodesic_points
+
+    g = geodesic_points(5)
+    holes = HexHoles(60 * g, g, wall=2, same_size=True)
+    assert np.ptp(holes.apothem) == 0 and holes.apothem[0] > 0
+    # A straight prism: the same distance across the hole at the surface and 20 mm out.
+    n = g[7]
+    t = np.cross(n, [0, 0, 1.0]) if abs(n[2]) < 0.9 else np.cross(n, [1.0, 0, 0])
+    t /= np.linalg.norm(t)
+    f = 60 * n + 2.0 * t
+    a = holes.field(f[None])
+    b = holes.field(f[None], (f + 20 * n)[None])
+    assert a == pytest.approx(b, abs=1e-6)

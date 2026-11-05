@@ -334,10 +334,15 @@ class HexHoles:
     neighbours, and the walls are `wall` thick where cells are tightest and
     thicker where there is room.
 
+    Each hole is a straight hexagonal prism along the normal at its centre,
+    so it is the same size all the way through the shell however far the
+    shell stands off the surface.
+
     seeds, normals  (n, 3) cell centres on the surface and the surface normal there
+    same_size       every hole as big as the tightest pair allows, so all are equal
     """
 
-    def __init__(self, seeds, normals, wall, neighbours=6):
+    def __init__(self, seeds, normals, wall, neighbours=6, same_size=False):
         from scipy.spatial import cKDTree
 
         self.seeds = np.asarray(seeds, dtype=np.float64)
@@ -375,20 +380,31 @@ class HexHoles:
         size = (dist - wall) / both
         real = dist < 1.35 * dist[:, :1]  # neighbours, not the cell beyond
         self.apothem = np.maximum(np.where(real, size, np.inf).min(axis=1), 0.0)
+        self.wall = float(wall)
+        if same_size:
+            self.apothem[:] = self.apothem.min()
 
-    def field(self, p, k=3):
-        """Distance (mm, in the cells' tangent planes) from points p (m, 3) on
-        the surface to the nearest hole's edge: positive between holes
-        (material), negative inside one."""
-        _, nb = self.tree.query(p, k=min(k, len(self.seeds)))
-        nb = nb.reshape(len(p), -1)
-        best = np.full(len(p), np.inf)
-        for j in range(nb.shape[1]):
+    def field(self, f, p=None, k=3):
+        """Distance (mm, across the hole prisms) to the nearest hole's edge:
+        positive between holes (material), negative inside one. `f` (m, 3) is
+        where each point lands on the surface, which picks the cells to test;
+        `p` is the point itself (default: f), measured across the prisms."""
+        p = f if p is None else p
+        d, nb = self.tree.query(f, k=min(max(k, 4), len(self.seeds)))
+        d, nb = d.reshape(len(f), -1), nb.reshape(len(f), -1)
+        best = np.full(len(f), np.inf)
+        for j in range(min(k, nb.shape[1])):
             i = nb[:, j]
             q = (p - self.seeds[i])[:, None, :]
             inside = np.abs((q * self.normals[i]).sum(-1)).max(axis=1) - self.apothem[i]
             best = np.minimum(best, inside)
-        return best
+        # Where the surface curves inward the prisms lean together; keep at
+        # least the wall along the cell borders there too.
+        border = np.full(len(f), np.inf)
+        for j in range(1, nb.shape[1]):
+            gap = np.linalg.norm(self.seeds[nb[:, j]] - self.seeds[nb[:, 0]], axis=1)
+            border = np.minimum(border, (d[:, j] ** 2 - d[:, 0] ** 2) / (2 * np.maximum(gap, 1e-9)))
+        return np.maximum(best, 0.5 * self.wall - border)
 
 
 # Lattices laid out around the helmet centre in world coordinates, so they

@@ -27,8 +27,9 @@ def _parser():
     o.add_argument("--center", type=float, nargs=3, metavar=("X", "Y", "Z"), help="helmet centre")
     o.add_argument("--pole", choices=["x", "y", "z"], help="pole axis for spherical/conformal maps")
     o.add_argument("--layers", type=int, help="cells through the shell (conformal)")
-    o.add_argument("--hex-holes", choices=["cells", "regular"],
-                   help="geodesic_hex: walls of even thickness, or every hole a regular hexagon with walls from --wall up")
+    o.add_argument("--hex-holes", choices=["cells", "regular", "same"],
+                   help="geodesic_hex: walls of even thickness, or every hole a regular hexagon (as big as fits, "
+                        "or all one size) with walls from --wall up")
     ap.add_argument("--reference", help="body to lay cells over (e.g. the headform, STL/OBJ, same coordinates); "
                                         "sets wrap to 'reference' for geodesic_hex and conformal lattices")
     o.add_argument("--wall", dest="wall_min", type=float, help="wall/strut thickness, mm")
