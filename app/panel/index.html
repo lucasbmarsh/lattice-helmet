@@ -343,7 +343,7 @@ async function loadReference() {
     groups.ref.visible = $("show-ref").checked;
     $("show-ref-row").classList.remove("hidden"); $("ref-clear").disabled = false;
     showRefInfo(`Using ${info.name || "the reference body"}: about ${info.gap_mm} mm inside the shell` +
-      (info.capped ? `, open in ${info.capped} place${info.capped > 1 ? "s" : ""}, closed with a rounded cap there.` : "."), "ok");
+      (info.capped ? `, open in ${info.capped} place${info.capped > 1 ? "s" : ""}, closed with a flat cap there. A headform closed at the back gives truer cells there.` : "."), "ok");
     viewMsg("");
     schedulePreview(0);
   } catch (e) {

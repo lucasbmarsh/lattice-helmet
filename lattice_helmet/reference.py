@@ -348,17 +348,18 @@ def _farthest_first(pts, n, start=0):
     return np.array(pick)
 
 
-def cap_openings(mesh, spacing, min_size=20.0, bulge=0.5):
-    """Fill each opening in an open surface with a rounded cap, as samples:
-    a list of (points, normals, areas), one per opening at least `min_size`
-    mm across.
+def cap_openings(mesh, spacing, min_size=20.0, bulge=0.0):
+    """Fill each opening in an open surface with a cap, as samples: a list of
+    (points, normals, areas), one per opening at least `min_size` mm across.
 
-    The cap is a dome over the opening's best-fit plane, bulging away from the
-    rest of the surface, that starts square to the plane at the edge (where
-    a head cut flat at the back meets its cut) and rises to `bulge` times
-    the opening's inner radius in the middle, which is about how far the back
-    of a head rounds out. The cut is rarely the part the helmet is about, so
-    a plausible, smooth stand-in beats cells fanning out from the edge.
+    The cap lies on the opening's best-fit plane, and can dome away from the
+    rest of the surface by `bulge` times the opening's inner radius. It is flat
+    by default: a dome guessed from the opening alone can poke through the
+    helmet (on a headform cut flat at the back, a half-radius dome stood 20 mm
+    proud of the helmet's back and warped the cells there), while the cut
+    plane stays close to it. The cut is rarely the part the helmet is about,
+    so a plain stand-in beats cells fanning out from the edge; a closed
+    reference body gives the true shape.
     """
     from scipy import ndimage
     from skimage.draw import polygon as fill_polygon

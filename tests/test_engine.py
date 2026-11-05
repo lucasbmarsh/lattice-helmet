@@ -263,14 +263,22 @@ def test_reference_walls_run_along_the_surface_normal():
 
 
 def test_open_reference_gets_a_cap():
-    from lattice_helmet.reference import Reference
+    from lattice_helmet.reference import Reference, cap_openings
 
     head = _head((70, 70, 70))
     back = head.triangles_center[:, 1] < -40  # cut off flat at the back
-    ref = Reference(trimesh.Trimesh(head.vertices, head.faces[~back]))
+    open_head = trimesh.Trimesh(head.vertices, head.faces[~back])
+    ref = Reference(open_head)
     assert ref.capped == 1
-    cap = ref.points[len(ref.points) - 1]
-    assert cap[1] < -40  # the cap closes the back, bulging outward
+    n = len(cap_openings(ref.mesh, 1.5)[0][0])
+    cap, normals = ref.points[-n:], ref.normals[-n:]
+    rim = open_head.vertices[np.unique(open_head.outline().entities[0].points)]
+    # Flat on the cut, so it can't poke out through the back of a helmet
+    # the way a guessed dome can, and it spans the opening.
+    assert np.ptp(cap[:, 1]) < 1.0
+    assert abs(cap[:, 1].mean() - rim[:, 1].mean()) < 1.0
+    assert np.ptp(cap[:, 0]) > 0.8 * np.ptp(rim[:, 0])
+    assert (normals[:, 1] < -0.99).all()  # facing out the back
 
 
 def test_reference_meridians_match_a_sphere():

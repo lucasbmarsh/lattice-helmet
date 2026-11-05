@@ -113,9 +113,10 @@ shells, volumes and relative density.
    point near the body, a gently bent path further out. So the holes follow
    the body's normals. The conformal map measures distance from the crown
    along the body's meridians instead of as an angle on a sphere. Openings in
-   an open surface (a headform cut off flat at the back) get a rounded cap.
-   Cells are laid out from the body's own centre, so every panel of a split
-   helmet gets the same layout.
+   an open surface (a headform cut off flat at the back) get a flat cap (a
+   domed guess can poke through the helmet, so close the body for the true
+   shape there). Cells are laid out from the body's own centre, so every
+   panel of a split helmet gets the same layout.
 
 6. `fea.py` voxelises the part into cube elements (stiffness scaled by how
    full each one is, `E * density^2`, so a latticed part is analysed as a
