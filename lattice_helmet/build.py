@@ -30,6 +30,8 @@ class LatticeSpec:
     up: str = "auto"  # which way the crown points: auto, +z, -y, ...
     pole: str = None  # spherical: pole axis (default x, poles at the ears); conformal: crown axis (default z)
     layers: int = None  # cells through the shell for the conformal map (default: auto)
+    hex_holes: str = "cells"  # geodesic_hex: "cells" (walls of even thickness) or "regular" (every hole a
+    # perfect hexagon; walls are wall_min where cells are tightest and thicker elsewhere)
     wrap: str = "sphere"  # lay geodesic_hex and conformal cells over a "sphere" fit or the "reference" body
     # (with "reference", cell sizes are measured on the reference body's surface)
     wall_min: float = 0.8  # wall / strut thickness where grading = 0, mm
@@ -70,7 +72,7 @@ class LatticeSpec:
 # keys, which override the main settings inside the zone. Later regions win
 # where they overlap. Besides the lattices, a region can be "solid" (fully
 # filled, e.g. around a mounting point) or "empty".
-REGION_KEYS = ("lattice", "cell", "graph", "seed", "jitter", "cell_map", "pole", "layers", "wrap",
+REGION_KEYS = ("lattice", "cell", "graph", "seed", "jitter", "cell_map", "pole", "layers", "wrap", "hex_holes",
                "wall_min", "wall_max", "grading", "grade_point", "grade_depth", "grade_expr")
 FILLS = ("solid", "empty")
 
@@ -190,11 +192,14 @@ def _grading(spec, x, y, z, s, aux, bounds, env=None):
 
 
 WRAPS = ("sphere", "reference")
+HEX_HOLES = ("cells", "regular")
 
 
 def _validate(spec, allow_fill=False):
     if spec.wrap not in WRAPS:
         raise ValueError(f"wrap must be one of {WRAPS}")
+    if spec.hex_holes not in HEX_HOLES:
+        raise ValueError(f"hex_holes must be one of {HEX_HOLES}")
     kinds = fields.lattice_kinds() + (list(FILLS) if allow_fill else [])
     if spec.lattice not in kinds:
         raise ValueError(f"lattice must be one of {kinds}")
@@ -341,14 +346,19 @@ def _chunks(shell, spec, compiled, cache=None, reference=None):
             # Lattice on the slab plus a one-slice halo, so the gradient is centred.
             hx, hy, hz = grid.coords(h0, h1)
             wrapped = sub.wrap == "reference"
+            regular = sub.lattice == "geodesic_hex" and sub.hex_holes == "regular"
+            # Only points in or near the part matter, and each costs a
+            # nearest-point lookup, so skip the rest.
+            near = sdf[:, :, h0:h1] < spec.fillet + 3 * spec.pitch + sub.wall_max
             if sub.lattice in fields.RADIAL and wrapped:
-                # Only points in or near the part matter, and each costs a
-                # nearest-point lookup on the reference, so skip the rest.
-                near = sdf[:, :, h0:h1] < spec.fillet + 3 * spec.pitch + sub.wall_max
                 # Cells are `cell` across on the reference and laid out from
                 # its own centre, so the panels of a split helmet line up.
-                R = reference.hex_field(hx, hy, hz, sub.cell, reference.center, up, shell.bounds, mask=near)
-                mode = (fields.RADIAL[sub.lattice][1], 1.0)
+                R = reference.hex_field(hx, hy, hz, sub.cell, reference.center, up, shell.bounds, mask=near,
+                                        holes_wall=sub.wall_min if regular else None)
+                mode = ("hole", sub.wall_min) if regular else (fields.RADIAL[sub.lattice][1], 1.0)
+            elif regular:
+                R = _sphere_holes(hx, hy, hz, near, sub, center, up, ref_radius)
+                mode = ("hole", sub.wall_min)
             elif sub.lattice in fields.RADIAL:
                 fn, m = fields.RADIAL[sub.lattice]
                 R, mode = fn(hx, hy, hz, sub.cell, center, up, ref_radius), (m, 1.0)
@@ -412,6 +422,21 @@ def _chunks(shell, spec, compiled, cache=None, reference=None):
         count += 1
         yield vtx, faces
     spec.log(f"meshed {count} chunks in {time.time() - t0:.1f}s")
+
+
+def _sphere_holes(x, y, z, mask, spec, center, up, radius):
+    """geodesic_hex with regular holes on the sphere fit: the same cells as
+    fields.geodesic_hex, each point taking the cell its direction from the
+    centre points at, so holes run along the radius."""
+    g = fields.geodesic_points(max(1, int(round(1.1071 * radius / spec.cell))), up)
+    holes = fields.HexHoles(center + radius * g, g, spec.wall_min)
+    x, y, z = np.broadcast_arrays(x, y, z)
+    out = np.full(x.shape, np.float32(spec.cell), dtype=np.float32)
+    sel = np.broadcast_to(mask, x.shape)
+    p = np.stack([x[sel], y[sel], z[sel]], axis=1).astype(np.float64) - center
+    p *= radius / np.maximum(np.linalg.norm(p, axis=1, keepdims=True), 1e-9)
+    out[sel] = holes.field(p + center)
+    return out
 
 
 def _concat(pieces):

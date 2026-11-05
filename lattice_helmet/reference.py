@@ -215,13 +215,29 @@ class Reference:
         d, _ = cKDTree(seeds).query(seeds, k=4)
         return float(np.median(d[:, 1:]))
 
-    def hex_field(self, x, y, z, cell, center, up, bounds, mask=None, block=1 << 19):
+    def hex_holes(self, cell, center, up, wall):
+        """fields.HexHoles for the cells: a regular hexagonal hole per cell,
+        keeping at least `wall` mm between holes."""
+        from .fields import HexHoles
+
+        key = ("holes", round(float(cell), 3), tuple(np.round(center, 2)), tuple(up), round(float(wall), 3))
+        if key not in self._seeds:
+            seeds = self.hex_seeds(cell, center, up)
+            _, i = self.tree.query(seeds)
+            self._seeds[key] = HexHoles(seeds, self.normals[i], wall)
+        return self._seeds[key]
+
+    def hex_field(self, x, y, z, cell, center, up, bounds, mask=None, holes_wall=None, block=1 << 19):
         """Distance (mm, on the reference surface) from where each point
         lands on the reference (see `landing`) to the walls between the
         hexagonal cells. Points outside `mask` get `cell` (far from any
-        wall); `bounds` is the region all the points come from."""
+        wall); `bounds` is the region all the points come from.
+
+        With `holes_wall`, the distance to the nearest regular hexagonal
+        hole instead (see fields.HexHoles), positive between holes."""
         seeds = self.hex_seeds(cell, center, up)
         tree = cKDTree(seeds)
+        holes = None if holes_wall is None else self.hex_holes(cell, center, up, holes_wall)
         x, y, z = np.broadcast_arrays(x, y, z)
         shape = x.shape
         out = np.full(int(np.prod(shape)), np.float32(cell), dtype=np.float32)
@@ -234,6 +250,9 @@ class Reference:
             idx = sel[s0:s0 + block]
             p = np.stack([xs[idx], ys[idx], zs[idx]], axis=1).astype(np.float64)
             f = self.landing(p, bounds)
+            if holes is not None:
+                out[idx] = holes.field(f)
+                continue
             d, nb = tree.query(f, k=k)
             s1 = seeds[nb[:, 0]]
             best = np.full(len(f), np.inf)

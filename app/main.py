@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 import numpy as np
 
-from lattice_helmet.build import GRADINGS, WRAPS, LatticeSpec, simulate
+from lattice_helmet.build import GRADINGS, HEX_HOLES, WRAPS, LatticeSpec, simulate
 from lattice_helmet.fea import MATERIALS, SimSpec, TopoSpec, density_mesh
 from lattice_helmet.fields import lattice_kinds
 from lattice_helmet.maps import MAPS
@@ -95,7 +95,7 @@ def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
         """What the panel's dropdowns offer, and the default recipe."""
         return {"lattices": lattice_kinds(), "cell_maps": list(MAPS),
                 "gradings": list(GRADINGS), "materials": {k: {"E": e, "nu": n} for k, (e, n) in MATERIALS.items()},
-                "skin_surfaces": ["all", "outer", "inner", "rim"], "wraps": list(WRAPS),
+                "skin_surfaces": ["all", "outer", "inner", "rim"], "wraps": list(WRAPS), "hex_holes": list(HEX_HOLES),
                 "auth": "oauth" if oauth else "server",
                 "defaults": json.loads(LatticeSpec().to_json())}
 

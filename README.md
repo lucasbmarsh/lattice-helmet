@@ -47,6 +47,7 @@ The helmet is assumed to sit crown up (+z) with the rim at its lowest point; pas
 | `--fillet` | blend radius where lattice meets skin, mm |
 | `--pitch` | voxel size, mm. Keep it at or below half the sheet wall, a quarter of the strut diameter |
 | `--decimate` | fraction of triangles to remove after meshing |
+| `--hex-holes` | for `geodesic_hex`: `cells` (walls of even thickness around slightly uneven cells) or `regular` (every hole a regular hexagon in the surface's tangent plane, flats facing its neighbours, as big as it can be while keeping `--wall` to the next hole; walls thicken from there) |
 | `--reference` | body to lay `geodesic_hex` and `conformal` cells over instead of a sphere, e.g. the headform the helmet was built on (STL/OBJ, same coordinates as the shell; an open surface is fine). Sets `"wrap": "reference"`; cell sizes are then measured on that body |
 | `--recipe`, `--save-recipe` | load / write the full spec as JSON |
 
@@ -143,6 +144,11 @@ shells, volumes and relative density.
 - The conformal map compresses cells around the circumference toward the rim
   (about 0.64x at the equator), because it flattens the dome from the crown.
   A reference body fixes the size down each meridian, not around.
+- Hexagons can't tile a closed curved surface (a dome needs at least 12
+  other cells), so `geodesic_hex` cells vary a little in size and shape.
+  `hex_holes: "regular"` keeps every hole a perfect hexagon and lets the walls
+  vary instead; holes are sized by their tightest neighbour, so they differ
+  by about 10% in size.
 - With a reference body, cells stretch where the shell stands far off it
   (e.g. a back panel hanging behind the neck), and the relaxed layout has a
   few 5- and 7-sided cells where the rows meet. The cap over an open surface

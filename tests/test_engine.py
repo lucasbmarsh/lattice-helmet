@@ -302,3 +302,39 @@ def test_build_wrapped_around_a_reference():
     c = preview(dome, LatticeSpec(wrap="reference", cell_map="conformal", lattice="honeycomb_hex", cell=8,
                                   **QUIET), voxels=4e5, reference=Reference(head))[0]
     assert len(c.faces) > 1000
+
+
+def test_regular_hex_holes_keep_the_minimum_wall():
+    from lattice_helmet.fields import HexHoles, geodesic_points
+
+    # Flat, perfect hexagonal cells 10 mm apart: holes are 10 - wall across the flats.
+    ii, jj = np.meshgrid(np.arange(-4, 5), np.arange(-4, 5))
+    pts = np.stack([10 * (ii + 0.5 * jj), 10 * np.sqrt(3) / 2 * jj, 0 * ii], axis=-1).reshape(-1, 3)
+    holes = HexHoles(pts, np.tile([0, 0, 1.0], (len(pts), 1)), wall=2)
+    centre = np.argmin(np.linalg.norm(pts, axis=1))
+    assert holes.apothem[centre] == pytest.approx(4, abs=1e-6)
+    assert holes.field(np.array([[0, 0, 0], [5, 0, 0]]))[[0, 1]] == pytest.approx([-4, 1], abs=1e-6)
+
+    # On a sphere the cells vary; the wall between any two holes is still >= 2 mm.
+    g = geodesic_points(5)
+    holes = HexHoles(60 * g, g, wall=2)
+    from scipy.spatial import cKDTree
+    _, nb = cKDTree(g).query(g, k=2)
+    t = np.linspace(0, 1, 400)[:, None]
+    for i, j in nb[:200]:
+        line = 60 * (g[i] + t * (g[j] - g[i]))
+        material = holes.field(line) > 0
+        assert material.sum() / len(t) * np.linalg.norm(60 * (g[j] - g[i])) >= 2 - 0.1
+
+
+def test_regular_hex_holes_build_on_a_sphere_and_a_reference():
+    from lattice_helmet.reference import Reference
+
+    dome = _dome()
+    spec = dict(lattice="geodesic_hex", hex_holes="regular", cell=12, wall_min=1.5, wall_max=1.5, skin=0,
+                fillet=0, pitch=0.75, **QUIET)
+    a = build(dome, LatticeSpec(**spec))
+    b = build(dome, LatticeSpec(wrap="reference", **spec), reference=Reference(trimesh.creation.icosphere(4, radius=40)))
+    even = build(dome, LatticeSpec(**dict(spec, hex_holes="cells")))
+    assert a.is_watertight and b.is_watertight
+    assert a.volume > even.volume  # walls only thicken from the minimum
