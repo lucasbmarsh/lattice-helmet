@@ -37,7 +37,7 @@ class FakeOnshape:
     def list_parts(self, did, wvm, wvmid, eid):
         return [{"partId": "JHD", "name": "Liner"}]
 
-    def export_stl(self, did, wvm, wvmid, eid, part_id):
+    def export_stl(self, did, wvm, wvmid, eid, part_id, closed=True):
         assert part_id == "JHD"
         return _dome_stl()
 
@@ -230,3 +230,53 @@ def test_tessellated_faces_stitch_into_a_closed_mm_mesh():
     assert m.is_watertight and m.volume == pytest.approx(20 * 30 * 40, rel=1e-6)
     old = [{"faces": [{"facets": [{"vertices": tri.tolist()} for tri in box.triangles]}]}]  # older API: lists
     assert trimesh.load(io.BytesIO(_faces_to_stl(old)), file_type="stl").is_watertight
+
+
+def test_reference_body_wraps_the_cells(client):
+    files = {"file": ("shell.stl", io.BytesIO(_dome_stl()), "model/stl")}
+    s = client.post("/api/shells/upload", files=files).json()
+    recipe = dict(FAST, lattice="geodesic_hex", cell=12, wrap="reference")
+    r = client.post(f"/api/shells/{s['id']}/preview", json={"recipe": recipe, "detail": 0.25})
+    assert r.status_code == 422 and "reference" in r.json()["detail"]
+    assert client.post(f"/api/shells/{s['id']}/build", json={"recipe": recipe}).status_code == 422
+
+    # An open "headform": a sphere inside the dome with its bottom cut off.
+    head = trimesh.creation.icosphere(3, radius=40)
+    head.update_faces(head.triangles_center[:, 2] > -20)
+    far = head.copy()
+    far.apply_translation((1000, 0, 0))
+    bad = client.post(f"/api/shells/{s['id']}/reference/upload",
+                      files={"file": ("far.stl", io.BytesIO(far.export(file_type="stl")), "model/stl")})
+    assert bad.status_code == 422 and "same place" in bad.json()["detail"]
+    info = client.post(f"/api/shells/{s['id']}/reference/upload",
+                       files={"file": ("head.stl", io.BytesIO(head.export(file_type="stl")), "model/stl")}).json()
+    assert info["capped"] == 1 and 5 < info["gap_mm"] < 20
+    assert _unpack(client.get(f"/api/shells/{s['id']}/reference/mesh").content)[1] == len(head.faces)
+
+    r = client.post(f"/api/shells/{s['id']}/preview", json={"recipe": recipe, "detail": 0.25})
+    assert r.status_code == 200, r.text
+    job = client.post(f"/api/shells/{s['id']}/build", json={"recipe": recipe}).json()
+    j = _wait(client, job["id"])
+    assert j["status"] == "done" and j["report"]["watertight"], j
+
+    assert client.delete(f"/api/shells/{s['id']}/reference").status_code == 200
+    assert client.get(f"/api/shells/{s['id']}/reference/mesh").status_code == 404
+
+
+def test_onshape_link_lists_the_parts_of_another_tab(client):
+    url = ("https://cad.onshape.com/documents/161250cd2a6de049d2d491de/w/432318b5c8955c61882e17b0"
+           "/e/510fc294ce58770a39de3cc6?renderMode=0")
+    r = client.get("/api/onshape/link", params={"url": url}).json()
+    assert r["did"] == "161250cd2a6de049d2d491de" and r["wvm"] == "w" and r["parts"][0]["partId"] == "JHD"
+    assert client.get("/api/onshape/link", params={"url": "https://example.com"}).status_code == 422
+
+
+def test_open_surface_from_onshape_is_kept_open():
+    from app.onshape import _faces_to_stl
+
+    tri = [[{"x": 0, "y": 0, "z": 0}, {"x": 0.01, "y": 0, "z": 0}, {"x": 0, "y": 0.01, "z": 0}]]
+    resp = [{"faces": [{"facets": [{"vertices": v} for v in tri]}]}]
+    with pytest.raises(ValueError):
+        _faces_to_stl(resp)
+    mesh = trimesh.load(io.BytesIO(_faces_to_stl(resp, closed=False)), file_type="stl")
+    assert len(mesh.faces) == 1 and mesh.bounds[1][0] == pytest.approx(10)

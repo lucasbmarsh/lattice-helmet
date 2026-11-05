@@ -28,10 +28,11 @@ class OnshapeError(RuntimeError):
 _STL_FACET = np.dtype([("normal", "<f4", 3), ("v", "<f4", (3, 3)), ("attr", "<u2")])
 
 
-def _faces_to_stl(resp):
+def _faces_to_stl(resp, closed=True):
     """Binary STL (mm) from a /tessellatedfaces response (metres). Faces are
     tessellated separately but share their edge points, so merging equal
-    vertices stitches them into a closed mesh."""
+    vertices stitches them into a closed mesh. closed=False accepts an open
+    surface (a sheet body, such as a headform surface)."""
     import io
 
     import numpy as np
@@ -48,9 +49,9 @@ def _faces_to_stl(resp):
     mesh = trimesh.Trimesh(t, np.arange(len(t)).reshape(-1, 3), process=False)
     mesh.merge_vertices(digits_vertex=4)
     mesh.remove_unreferenced_vertices()
-    if not mesh.is_watertight:
+    if closed and not mesh.is_watertight:
         raise ValueError("tessellated faces did not stitch into a closed mesh")
-    if mesh.volume < 0:
+    if closed and mesh.volume < 0:
         mesh.invert()
     out = io.BytesIO()
     mesh.export(out, file_type="stl")
@@ -97,19 +98,20 @@ class Onshape:
         r = self._get(f"/api/parts/d/{did}/{wvm}/{wvmid}/e/{eid}")
         return [{"partId": p["partId"], "name": p.get("name", p["partId"])} for p in r.json()]
 
-    def export_stl(self, did, wvm, wvmid, eid, part_id, poll=1.0, max_wait=300):
+    def export_stl(self, did, wvm, wvmid, eid, part_id, poll=1.0, max_wait=300, closed=True):
         """Binary STL of one part, in millimetres, tessellated finely.
 
         The translation API ignores tessellation settings and gives coarse
         facets (a helmet came out at 2,000 triangles, which show as flats in
         the lattice), so ask for the part's faces at 0.2 mm chord tolerance
         and stitch them; fall back to the translation API if that fails.
+        closed=False also takes surfaces (sheet bodies), which are open.
         """
         try:
             r = self._get(f"/api/partstudios/d/{did}/{wvm}/{wvmid}/e/{eid}/tessellatedfaces",
                           partId=part_id, chordTolerance=0.0002, angleTolerance=0.1,
                           outputFaceAppearances="false")
-            return _faces_to_stl(r.json())
+            return _faces_to_stl(r.json(), closed)
         except (OnshapeError, KeyError, ValueError):
             return self._translate_stl(did, wvm, wvmid, eid, part_id, poll, max_wait)
 

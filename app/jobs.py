@@ -17,6 +17,7 @@ import uuid
 import trimesh
 
 from lattice_helmet.build import LatticeSpec, build, report
+from lattice_helmet.reference import Reference
 
 
 @dataclass
@@ -44,13 +45,16 @@ class JobQueue:
         self.lock = threading.Lock()
         self.pool = ThreadPoolExecutor(max_workers=workers)
 
-    def submit(self, shell_bytes, recipe, filetype="stl", source=None):
+    def submit(self, shell_bytes, recipe, filetype="stl", source=None, reference=None):
+        """reference: (bytes, filetype) of the body wrap="reference" lays cells over."""
         spec = LatticeSpec.from_dict(recipe)  # validate before queueing
+        if spec.wrap == "reference" and reference is None:
+            raise ValueError("wrap 'reference' needs a reference body: load one (e.g. the headform) first")
         job = Job(id=uuid.uuid4().hex[:12], source=source)
         with self.lock:
             self.jobs[job.id] = job
         (self.dir / f"{job.id}.json").write_text(spec.to_json())
-        self.pool.submit(self._run, job, shell_bytes, recipe, filetype)
+        self.pool.submit(self._run, job, shell_bytes, recipe, filetype, reference)
         return job
 
     def run(self, fn, kind, source=None):
@@ -78,12 +82,13 @@ class JobQueue:
     def result_path(self, job_id):
         return self.dir / f"{job_id}.3mf"
 
-    def _run(self, job, shell_bytes, recipe, filetype):
+    def _run(self, job, shell_bytes, recipe, filetype, reference=None):
         job.status = "running"
         try:
             shell = trimesh.load(io.BytesIO(shell_bytes), file_type=filetype, force="mesh")
             spec = LatticeSpec.from_dict(recipe, log=job.log.append)
-            part = build(shell, spec)
+            ref = Reference.load(*reference) if reference and spec.wrap == "reference" else None
+            part = build(shell, spec, reference=ref)
             part.export(self.result_path(job.id))
             job.report = report(shell, part)
             (self.dir / f"{job.id}.report.json").write_text(json.dumps(job.report))

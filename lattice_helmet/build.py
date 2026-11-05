@@ -30,6 +30,11 @@ class LatticeSpec:
     up: str = "auto"  # which way the crown points: auto, +z, -y, ...
     pole: str = None  # spherical: pole axis (default x, poles at the ears); conformal: crown axis (default z)
     layers: int = None  # cells through the shell for the conformal map (default: auto)
+    hex_holes: str = "cells"  # geodesic_hex: "cells" (walls of even thickness), "regular" (every hole a
+    # perfect hexagon as big as fits; walls are wall_min where cells are tightest and thicker elsewhere) or
+    # "same" (perfect hexagons, all the size of the tightest fit)
+    wrap: str = "sphere"  # lay geodesic_hex and conformal cells over a "sphere" fit or the "reference" body
+    # (with "reference", cell sizes are measured on the reference body's surface)
     wall_min: float = 0.8  # wall / strut thickness where grading = 0, mm
     wall_max: float = 0.8  # wall / strut thickness where grading = 1, mm
     grading: str = "uniform"  # uniform | z | depth | point | expr
@@ -68,7 +73,7 @@ class LatticeSpec:
 # keys, which override the main settings inside the zone. Later regions win
 # where they overlap. Besides the lattices, a region can be "solid" (fully
 # filled, e.g. around a mounting point) or "empty".
-REGION_KEYS = ("lattice", "cell", "graph", "seed", "jitter", "cell_map", "pole", "layers",
+REGION_KEYS = ("lattice", "cell", "graph", "seed", "jitter", "cell_map", "pole", "layers", "wrap", "hex_holes",
                "wall_min", "wall_max", "grading", "grade_point", "grade_depth", "grade_expr")
 FILLS = ("solid", "empty")
 
@@ -187,7 +192,15 @@ def _grading(spec, x, y, z, s, aux, bounds, env=None):
     raise ValueError(f"unknown grading {spec.grading!r}")
 
 
+WRAPS = ("sphere", "reference")
+HEX_HOLES = ("cells", "regular", "same")
+
+
 def _validate(spec, allow_fill=False):
+    if spec.wrap not in WRAPS:
+        raise ValueError(f"wrap must be one of {WRAPS}")
+    if spec.hex_holes not in HEX_HOLES:
+        raise ValueError(f"hex_holes must be one of {HEX_HOLES}")
     kinds = fields.lattice_kinds() + (list(FILLS) if allow_fill else [])
     if spec.lattice not in kinds:
         raise ValueError(f"lattice must be one of {kinds}")
@@ -260,8 +273,10 @@ def axis_name(up):
     return ("+" if up[1] > 0 else "-") + "xyz"[up[0]]
 
 
-def _chunks(shell, spec, compiled, cache=None):
-    """Mesh the part slab by slab; yields (vertices, faces) per chunk."""
+def _chunks(shell, spec, compiled, cache=None, reference=None):
+    """Mesh the part slab by slab; yields (vertices, faces) per chunk.
+    `reference` (reference.Reference) is the body that wrap="reference" lays
+    cells over."""
     t0 = time.time()
     grid, sdf, center, up, surfaces = _prepare(shell, spec, cache)
     spec.log(f"shell SDF done in {time.time() - t0:.1f}s")
@@ -272,6 +287,8 @@ def _chunks(shell, spec, compiled, cache=None):
         sub = _region_spec(spec, r)
         r = dict(r, _where=expr.compile_expr(r["where"]) if "where" in r else None)
         zones.append((sub, _validate(sub, allow_fill=True), r))
+    if reference is None and any(z[0].wrap == "reference" and z[0].lattice not in FILLS for z in zones):
+        raise ValueError("wrap 'reference' needs a reference body: load one (e.g. the headform) first")
 
     aux = {"center": center, "shell_t": None, "up": up, "edge": None}
     if any(z[0].grading in SIM_GRADINGS for z in zones):
@@ -329,14 +346,33 @@ def _chunks(shell, spec, compiled, cache=None):
                 return np.full(s.shape, -sub.cell if sub.lattice == "solid" else sub.cell, np.float32)
             # Lattice on the slab plus a one-slice halo, so the gradient is centred.
             hx, hy, hz = grid.coords(h0, h1)
-            if sub.lattice in fields.RADIAL:
+            wrapped = sub.wrap == "reference"
+            regular = sub.lattice == "geodesic_hex" and sub.hex_holes in ("regular", "same")
+            # Only points in or near the part matter, and each costs a
+            # nearest-point lookup, so skip the rest.
+            near = sdf[:, :, h0:h1] < spec.fillet + 3 * spec.pitch + sub.wall_max
+            if sub.lattice in fields.RADIAL and wrapped:
+                # Cells are `cell` across on the reference and laid out from
+                # its own centre, so the panels of a split helmet line up.
+                R = reference.hex_field(hx, hy, hz, sub.cell, reference.center, up, shell.bounds, mask=near,
+                                        holes_wall=sub.wall_min if regular else None,
+                                        same_size=sub.hex_holes == "same")
+                mode = ("hole", sub.wall_min) if regular else (fields.RADIAL[sub.lattice][1], 1.0)
+            elif regular:
+                R = _sphere_holes(hx, hy, hz, near, sub, center, up, ref_radius)
+                mode = ("hole", sub.wall_min)
+            elif sub.lattice in fields.RADIAL:
                 fn, m = fields.RADIAL[sub.lattice]
                 R, mode = fn(hx, hy, hz, sub.cell, center, up, ref_radius), (m, 1.0)
             else:
                 shell_t = None if aux["shell_t"] is None else aux["shell_t"][:, :, h0:h1]
                 pole = sub.pole or (axis_name(up) if sub.cell_map in ("conformal", "cylindrical") else None)
-                u, v, w = maps.map_coords(sub.cell_map, hx, hy, hz, sub.cell, center, ref_radius,
-                                          pole=pole, shell_t=shell_t, layers=layers_of(sub))
+                arc, c = None, center
+                if wrapped and sub.cell_map == "conformal":
+                    pole_up, c = parse_up(pole), reference.center
+                    arc = lambda t, a: reference.arc_from_crown(t, a, c, pole_up)  # noqa: E731
+                u, v, w = maps.map_coords(sub.cell_map, hx, hy, hz, sub.cell, c, ref_radius,
+                                          pole=pole, shell_t=shell_t, layers=layers_of(sub), arc=arc)
                 R, mode = fields.raw_field(sub.lattice, u, v, w, sub.cell, sub.graph,
                                            seed=sub.seed, jitter=sub.jitter)
                 del u, v, w
@@ -390,6 +426,21 @@ def _chunks(shell, spec, compiled, cache=None):
     spec.log(f"meshed {count} chunks in {time.time() - t0:.1f}s")
 
 
+def _sphere_holes(x, y, z, mask, spec, center, up, radius):
+    """geodesic_hex with regular holes on the sphere fit: the same cells as
+    fields.geodesic_hex, each point taking the cell its direction from the
+    centre points at, so holes run along the radius."""
+    g = fields.geodesic_points(max(1, int(round(1.1071 * radius / spec.cell))), up)
+    holes = fields.HexHoles(center + radius * g, g, spec.wall_min, same_size=spec.hex_holes == "same")
+    x, y, z = np.broadcast_arrays(x, y, z)
+    out = np.full(x.shape, np.float32(spec.cell), dtype=np.float32)
+    sel = np.broadcast_to(mask, x.shape)
+    p = np.stack([x[sel], y[sel], z[sel]], axis=1).astype(np.float64) - center
+    f = p * (radius / np.maximum(np.linalg.norm(p, axis=1, keepdims=True), 1e-9))
+    out[sel] = holes.field(f + center, p + center)
+    return out
+
+
 def _concat(pieces):
     verts, faces, offset = [], [], 0
     for v, fc in pieces:
@@ -399,13 +450,13 @@ def _concat(pieces):
     return np.vstack(verts), np.vstack(faces)
 
 
-def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
+def build(shell: trimesh.Trimesh, spec: LatticeSpec, reference=None) -> trimesh.Trimesh:
     compiled = _validate(spec)
     if not shell.is_watertight:
         spec.log("warning: input mesh is not watertight; inside test may leak")
 
     t0 = time.time()
-    pieces = list(_chunks(shell, spec, compiled))
+    pieces = list(_chunks(shell, spec, compiled, reference=reference))
     if not pieces:
         raise ValueError("the lattice came out empty; check cell size and wall thickness")
 
@@ -435,7 +486,7 @@ def build(shell: trimesh.Trimesh, spec: LatticeSpec) -> trimesh.Trimesh:
     return out
 
 
-def preview(shell, spec, voxels=1.5e6, max_faces=400_000, cache=None):
+def preview(shell, spec, voxels=1.5e6, max_faces=400_000, cache=None, reference=None):
     """A quick, coarse version of the part for the panel's live view.
 
     The voxel size is picked so the grid has about `voxels` samples, and the
@@ -472,7 +523,7 @@ def preview(shell, spec, voxels=1.5e6, max_faces=400_000, cache=None):
     quick = replace(spec, pitch=pitch, slab=128, decimate=0, regions=regions,
                     wall_min=drawn(spec.wall_min, f0), wall_max=drawn(spec.wall_max, f0),
                     skin=drawn(spec.skin, pitch) if spec.skin > 0 else 0)
-    pieces = list(_chunks(shell, quick, compiled, cache))
+    pieces = list(_chunks(shell, quick, compiled, cache, reference))
     if not pieces:
         raise ValueError("the lattice came out empty; check cell size and wall thickness")
     v, f = _concat(pieces)

@@ -16,6 +16,7 @@ import numpy as np
 import trimesh
 
 from lattice_helmet.build import SIM_GRADINGS, LatticeSpec, axis_name, preview, sim_key
+from lattice_helmet.reference import Reference
 from lattice_helmet.surfaces import detect_up
 
 
@@ -27,13 +28,33 @@ class Shell:
     mesh: trimesh.Trimesh
     source: dict = None  # Onshape ids, when it came from Onshape
     cache: dict = field(default_factory=dict)
+    # The body that wrap="reference" lays cells over (e.g. the headform),
+    # with its file for full builds.
+    reference: Reference = None
+    reference_file: tuple = None  # (bytes, filetype)
+    reference_info: dict = None
+
+    def set_reference(self, data, filetype="stl", source=None, name=None):
+        ref = Reference.load(data, filetype)
+        gap = ref.gap(self.mesh)
+        if gap > 0.5 * float(np.ptp(self.mesh.bounds, axis=0).max()):
+            raise ValueError(f"the reference body is {gap:.0f} mm from the part on average; "
+                             "is it in the same place and units as the shell?")
+        self.reference, self.reference_file = ref, (data, filetype)
+        self.reference_info = {"name": name, "triangles": len(ref.mesh.faces), "gap_mm": round(gap, 1),
+                               "capped": ref.capped, "closed": bool(ref.mesh.is_watertight), "source": source}
+        return self.reference_info
+
+    def clear_reference(self):
+        self.reference = self.reference_file = self.reference_info = None
 
     def public(self):
         if "up" not in self.cache:
             self.cache["up"] = detect_up(self.mesh)  # the same cache key build.resolve_up reads
         return {"id": self.id, "triangles": len(self.mesh.faces), "watertight": bool(self.mesh.is_watertight),
                 "up": axis_name(self.cache["up"]),
-                "bounds_mm": np.round(self.mesh.bounds, 1).tolist(), "source": self.source}
+                "bounds_mm": np.round(self.mesh.bounds, 1).tolist(), "source": self.source,
+                "reference": self.reference_info}
 
 
 def pack(mesh):
@@ -90,4 +111,4 @@ class ShellStore:
             if self.latest.get(shell.id) != n:
                 raise Superseded()
             return preview(shell.mesh, spec, voxels=1.5e6 * detail, max_faces=int(400_000 * detail),
-                           cache=shell.cache)
+                           cache=shell.cache, reference=shell.reference)

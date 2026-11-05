@@ -223,3 +223,142 @@ def test_cut_edges_of_a_panel_count_as_rim():
     sheet = ~cut & ((r > 99.5) | (r < 93.5))
     assert (labels[sheet & (r > 99.5)] == "outer").mean() > 0.95  # all but a sliver next to the cuts
     assert (labels[sheet & (r < 93.5)] == "inner").mean() > 0.95
+
+
+# -- reference body (wrap="reference") ----------------------------------------
+
+def _head(radii=(70, 90, 60)):
+    """A smooth, egg-like 'head': an ellipsoid, wider front-to-back than tall."""
+    head = trimesh.creation.icosphere(4, radius=1)
+    head.apply_scale(radii)
+    return head
+
+
+def test_reference_cells_keep_their_size_on_a_long_head():
+    from lattice_helmet.fields import geodesic_points
+    from lattice_helmet.reference import Reference
+    from scipy.spatial import cKDTree
+
+    head = _head()
+    ref = Reference(head)
+    seeds = ref.hex_seeds(15, np.zeros(3), (2, 1))
+    d, _ = cKDTree(seeds).query(seeds, k=4)
+    assert np.median(d[:, 1:]) == pytest.approx(15, rel=0.06)
+    spread = d[:, 1:].std() / d[:, 1:].mean()
+    # The sphere layout pushed straight out onto the same head stretches.
+    g = geodesic_points(round(1.1071 * 72 / 15), (2, 1)) * np.array([70, 90, 60])
+    d0, _ = cKDTree(g).query(g, k=4)
+    assert spread < 0.75 * (d0[:, 1:].std() / d0[:, 1:].mean())
+
+
+def test_reference_walls_run_along_the_surface_normal():
+    from lattice_helmet.reference import Reference
+
+    ref = Reference(trimesh.creation.icosphere(4, radius=50))
+    n = np.array([0.3, 0.2, 0.93])
+    n /= np.linalg.norm(n)
+    p = np.array([r * n for r in (50, 56, 62)])
+    f = ref.hex_field(p[:, 0], p[:, 1], p[:, 2], 12, np.zeros(3), (2, 1), bounds=[[-70] * 3, [70] * 3])
+    assert np.ptp(f) < 0.3  # same distance to the walls all the way out
+
+
+def test_open_reference_gets_a_cap():
+    from lattice_helmet.reference import Reference, cap_openings
+
+    head = _head((70, 70, 70))
+    back = head.triangles_center[:, 1] < -40  # cut off flat at the back
+    open_head = trimesh.Trimesh(head.vertices, head.faces[~back])
+    ref = Reference(open_head)
+    assert ref.capped == 1
+    n = len(cap_openings(ref.mesh, 1.5)[0][0])
+    cap, normals = ref.points[-n:], ref.normals[-n:]
+    rim = open_head.vertices[np.unique(open_head.outline().entities[0].points)]
+    # Flat on the cut, so it can't poke out through the back of a helmet
+    # the way a guessed dome can, and it spans the opening.
+    assert np.ptp(cap[:, 1]) < 1.0
+    assert abs(cap[:, 1].mean() - rim[:, 1].mean()) < 1.0
+    assert np.ptp(cap[:, 0]) > 0.8 * np.ptp(rim[:, 0])
+    assert (normals[:, 1] < -0.99).all()  # facing out the back
+
+
+def test_reference_meridians_match_a_sphere():
+    from lattice_helmet.reference import Reference
+
+    ref = Reference(trimesh.creation.icosphere(5, radius=50))
+    a = np.array([0.3, 0.8, 1.4])
+    s = ref.arc_from_crown(np.zeros(3), a, np.zeros(3), (2, 1))
+    assert s == pytest.approx(50 * a, rel=0.03)
+    s = ref.arc_from_crown(np.zeros(3), a, np.zeros(3), (2, 1), offset=10)
+    assert s == pytest.approx(60 * a, rel=0.03)
+
+
+def test_build_wrapped_around_a_reference():
+    from lattice_helmet.reference import Reference
+
+    dome = _dome()
+    head = trimesh.creation.icosphere(4, radius=40)
+    spec = dict(lattice="geodesic_hex", cell=12, wall_min=1.5, wall_max=1.5, skin=0, fillet=0, pitch=0.75, **QUIET)
+    with pytest.raises(ValueError, match="reference body"):
+        build(dome, LatticeSpec(wrap="reference", **spec))
+    b = build(dome, LatticeSpec(wrap="reference", **spec), reference=Reference(head))
+    assert b.is_watertight
+    # Cells are sized on the head (r = 40), so they come out bigger on the
+    # shell, as sphere cells sized at the shell's middle radius would be.
+    r = float(np.median(np.linalg.norm(dome.vertices, axis=1)))
+    a = build(dome, LatticeSpec(**dict(spec, cell=12 * r / 40)))
+    assert b.volume == pytest.approx(a.volume, rel=0.15)
+    c = preview(dome, LatticeSpec(wrap="reference", cell_map="conformal", lattice="honeycomb_hex", cell=8,
+                                  **QUIET), voxels=4e5, reference=Reference(head))[0]
+    assert len(c.faces) > 1000
+
+
+def test_regular_hex_holes_keep_the_minimum_wall():
+    from lattice_helmet.fields import HexHoles, geodesic_points
+
+    # Flat, perfect hexagonal cells 10 mm apart: holes are 10 - wall across the flats.
+    ii, jj = np.meshgrid(np.arange(-4, 5), np.arange(-4, 5))
+    pts = np.stack([10 * (ii + 0.5 * jj), 10 * np.sqrt(3) / 2 * jj, 0 * ii], axis=-1).reshape(-1, 3)
+    holes = HexHoles(pts, np.tile([0, 0, 1.0], (len(pts), 1)), wall=2)
+    centre = np.argmin(np.linalg.norm(pts, axis=1))
+    assert holes.apothem[centre] == pytest.approx(4, abs=1e-6)
+    assert holes.field(np.array([[0, 0, 0], [5, 0, 0]]))[[0, 1]] == pytest.approx([-4, 1], abs=1e-6)
+
+    # On a sphere the cells vary; the wall between any two holes is still >= 2 mm.
+    g = geodesic_points(5)
+    holes = HexHoles(60 * g, g, wall=2)
+    from scipy.spatial import cKDTree
+    _, nb = cKDTree(g).query(g, k=2)
+    t = np.linspace(0, 1, 400)[:, None]
+    for i, j in nb[:200]:
+        line = 60 * (g[i] + t * (g[j] - g[i]))
+        material = holes.field(line) > 0
+        assert material.sum() / len(t) * np.linalg.norm(60 * (g[j] - g[i])) >= 2 - 0.1
+
+
+def test_regular_hex_holes_build_on_a_sphere_and_a_reference():
+    from lattice_helmet.reference import Reference
+
+    dome = _dome()
+    spec = dict(lattice="geodesic_hex", hex_holes="regular", cell=12, wall_min=1.5, wall_max=1.5, skin=0,
+                fillet=0, pitch=0.75, **QUIET)
+    a = build(dome, LatticeSpec(**spec))
+    b = build(dome, LatticeSpec(wrap="reference", **spec), reference=Reference(trimesh.creation.icosphere(4, radius=40)))
+    even = build(dome, LatticeSpec(**dict(spec, hex_holes="cells")))
+    assert a.is_watertight and b.is_watertight
+    assert a.volume > even.volume  # walls only thicken from the minimum
+
+
+def test_same_size_holes_are_straight_and_equal():
+    from lattice_helmet.fields import HexHoles, geodesic_points
+
+    g = geodesic_points(5)
+    holes = HexHoles(60 * g, g, wall=2, same_size=True)
+    assert np.ptp(holes.apothem) == 0 and holes.apothem[0] > 0
+    # A straight prism: the same distance across the hole at the surface and 20 mm out.
+    n = g[7]
+    t = np.cross(n, [0, 0, 1.0]) if abs(n[2]) < 0.9 else np.cross(n, [1.0, 0, 0])
+    t /= np.linalg.norm(t)
+    f = 60 * n + 2.0 * t
+    a = holes.field(f[None])
+    b = holes.field(f[None], (f + 20 * n)[None])
+    assert a == pytest.approx(b, abs=1e-6)

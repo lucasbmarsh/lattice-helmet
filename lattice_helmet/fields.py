@@ -323,6 +323,90 @@ def geodesic_hex(x, y, z, cell, center, up, ref_radius):
     return out.reshape(shape)
 
 
+class HexHoles:
+    """Regular hexagonal holes, one per cell centre, each as big as it can be
+    while keeping at least `wall` mm to its neighbours' holes.
+
+    Hexagons can't tile a curved surface, so cells laid over a dome or a head
+    vary a little in size and shape. Rather than walls of even thickness
+    around uneven cells, every hole here is a perfect hexagon: it lies in the
+    surface's tangent plane at its centre, turned so its flats face its
+    neighbours, and the walls are `wall` thick where cells are tightest and
+    thicker where there is room.
+
+    Each hole is a straight hexagonal prism along the normal at its centre,
+    so it is the same size all the way through the shell however far the
+    shell stands off the surface.
+
+    seeds, normals  (n, 3) cell centres on the surface and the surface normal there
+    same_size       every hole as big as the tightest pair allows, so all are equal
+    """
+
+    def __init__(self, seeds, normals, wall, neighbours=6, same_size=False):
+        from scipy.spatial import cKDTree
+
+        self.seeds = np.asarray(seeds, dtype=np.float64)
+        n = np.asarray(normals, dtype=np.float64)
+        n = n / np.linalg.norm(n, axis=1, keepdims=True)
+        self.tree = cKDTree(self.seeds)
+        k = min(neighbours + 1, len(self.seeds))
+        dist, nb = self.tree.query(self.seeds, k=k)
+        dist, nb = dist[:, 1:], nb[:, 1:]
+        # A tangent frame per cell.
+        ref = np.where(np.abs(n[:, :1]) < 0.9, np.array([[1.0, 0, 0]]), np.array([[0, 1.0, 0]]))
+        t1 = np.cross(n, ref)
+        t1 /= np.linalg.norm(t1, axis=1, keepdims=True)
+        t2 = np.cross(n, t1)
+
+        def angle(i, j):  # direction from cell i to cell j in i's tangent plane
+            v = self.seeds[j] - self.seeds[i]
+            return np.arctan2((v * t2[i]).sum(-1), (v * t1[i]).sum(-1))
+
+        rows = np.arange(len(self.seeds))[:, None]
+        phi = angle(rows, nb)
+        # Flats face the neighbours: average the neighbour directions mod 60 degrees.
+        theta = np.angle(np.exp(6j * phi).mean(axis=1)) / 6
+        self.normals = np.stack([np.cos(theta[:, None] + a) * t1 + np.sin(theta[:, None] + a) * t2
+                                 for a in (0, np.pi / 3, 2 * np.pi / 3)], axis=1)  # (n, 3, 3)
+
+        def reach(i, ang):
+            """How far a hexagon of apothem 1 reaches toward `ang` (1 at a flat, 1.155 at a corner)."""
+            delta = np.abs((ang - theta[i] + np.pi / 6) % (np.pi / 3) - np.pi / 6)
+            return np.cos(np.pi / 6 - delta) / np.cos(np.pi / 6)
+
+        # Two holes at most (d - wall) apart along the line between their
+        # centres leave a wall at least `wall` thick between them.
+        both = reach(rows, phi) + reach(nb, angle(nb, rows))
+        size = (dist - wall) / both
+        real = dist < 1.35 * dist[:, :1]  # neighbours, not the cell beyond
+        self.apothem = np.maximum(np.where(real, size, np.inf).min(axis=1), 0.0)
+        self.wall = float(wall)
+        if same_size:
+            self.apothem[:] = self.apothem.min()
+
+    def field(self, f, p=None, k=3):
+        """Distance (mm, across the hole prisms) to the nearest hole's edge:
+        positive between holes (material), negative inside one. `f` (m, 3) is
+        where each point lands on the surface, which picks the cells to test;
+        `p` is the point itself (default: f), measured across the prisms."""
+        p = f if p is None else p
+        d, nb = self.tree.query(f, k=min(max(k, 4), len(self.seeds)))
+        d, nb = d.reshape(len(f), -1), nb.reshape(len(f), -1)
+        best = np.full(len(f), np.inf)
+        for j in range(min(k, nb.shape[1])):
+            i = nb[:, j]
+            q = (p - self.seeds[i])[:, None, :]
+            inside = np.abs((q * self.normals[i]).sum(-1)).max(axis=1) - self.apothem[i]
+            best = np.minimum(best, inside)
+        # Where the surface curves inward the prisms lean together; keep at
+        # least the wall along the cell borders there too.
+        border = np.full(len(f), np.inf)
+        for j in range(1, nb.shape[1]):
+            gap = np.linalg.norm(self.seeds[nb[:, j]] - self.seeds[nb[:, 0]], axis=1)
+            border = np.minimum(border, (d[:, j] ** 2 - d[:, 0] ** 2) / (2 * np.maximum(gap, 1e-9)))
+        return np.maximum(best, 0.5 * self.wall - border)
+
+
 # Lattices laid out around the helmet centre in world coordinates, so they
 # ignore the cell map: name -> (function, mode).
 RADIAL = {"geodesic_hex": (geodesic_hex, "sheet")}
@@ -371,6 +455,10 @@ def raw_field(kind, u, v, w, cell, graph=None, seed=0, jitter=1.0):
 def to_distance(R, grad, mode, wall, cell):
     """World-space signed distance (mm, negative = material)."""
     mode, cal = mode
+    if mode == "hole":
+        # R: distance to the nearest hole (positive between holes), with the
+        # holes cut for a `cal` mm wall; a thicker graded wall closes them in.
+        return -R / np.maximum(grad, 0.1) - 0.5 * (wall - cal)
     wall = wall * cal
     if mode == "sheet":
         g = np.maximum(grad, 0.1 * _TAU / cell)
