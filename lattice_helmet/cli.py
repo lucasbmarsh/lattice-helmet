@@ -27,6 +27,8 @@ def _parser():
     o.add_argument("--center", type=float, nargs=3, metavar=("X", "Y", "Z"), help="helmet centre")
     o.add_argument("--pole", choices=["x", "y", "z"], help="pole axis for spherical/conformal maps")
     o.add_argument("--layers", type=int, help="cells through the shell (conformal)")
+    ap.add_argument("--reference", help="body to lay cells over (e.g. the headform, STL/OBJ, same coordinates); "
+                                        "sets wrap to 'reference' for geodesic_hex and conformal lattices")
     o.add_argument("--wall", dest="wall_min", type=float, help="wall/strut thickness, mm")
     o.add_argument("--wall-max", type=float, help="thickness where grading = 1 (default: --wall)")
     o.add_argument("--grading", choices=["uniform", "z", "depth", "point", "expr"])
@@ -50,7 +52,9 @@ def main(argv=None):
         with open(a.recipe) as f:
             spec = json.load(f)
     overrides = {k: v for k, v in vars(a).items()
-                 if v is not None and k not in ("input", "output", "recipe", "save_recipe", "graph")}
+                 if v is not None and k not in ("input", "output", "recipe", "save_recipe", "graph", "reference")}
+    if a.reference:
+        overrides["wrap"] = "reference"
     if a.graph:
         with open(a.graph) as f:
             overrides["graph"] = json.load(f)
@@ -65,7 +69,14 @@ def main(argv=None):
     if not a.output:
         return
     shell = trimesh.load_mesh(a.input)
-    part = build(shell, spec)
+    ref = None
+    if spec.wrap == "reference":
+        if not a.reference:
+            raise SystemExit("wrap 'reference' needs --reference")
+        from .reference import Reference
+
+        ref = Reference(trimesh.load_mesh(a.reference))
+    part = build(shell, spec, reference=ref)
     part.export(a.output)
     print(json.dumps(report(shell, part), indent=2))
 

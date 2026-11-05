@@ -47,6 +47,7 @@ The helmet is assumed to sit crown up (+z) with the rim at its lowest point; pas
 | `--fillet` | blend radius where lattice meets skin, mm |
 | `--pitch` | voxel size, mm. Keep it at or below half the sheet wall, a quarter of the strut diameter |
 | `--decimate` | fraction of triangles to remove after meshing |
+| `--reference` | body to lay `geodesic_hex` and `conformal` cells over instead of a sphere, e.g. the headform the helmet was built on (STL/OBJ, same coordinates as the shell; an open surface is fine). Sets `"wrap": "reference"`; cell sizes are then measured on that body |
 | `--recipe`, `--save-recipe` | load / write the full spec as JSON |
 
 Recipes can also hold `regions`, `simulation` and `topopt` (no command-line
@@ -103,7 +104,19 @@ shells, volumes and relative density.
 4. `build.py` combines them as `max(shell, smooth_min(skin, lattice))` and runs
    marching cubes in z-slabs that overlap by one slice so they stitch exactly.
 
-5. `fea.py` voxelises the part into cube elements (stiffness scaled by how
+5. With a reference body (`reference.py`, `"wrap": "reference"`), the
+   geodesic hex cells are spread evenly over that body (a geodesic sphere
+   pushed onto it, thinned to the number of cells its area holds, then Lloyd
+   relaxed), and each point of the shell takes the cell of the point it lands
+   on when it moves down a smoothed distance field to the body: its nearest
+   point near the body, a gently bent path further out. So the holes follow
+   the body's normals. The conformal map measures distance from the crown
+   along the body's meridians instead of as an angle on a sphere. Openings in
+   an open surface (a headform cut off flat at the back) get a rounded cap.
+   Cells are laid out from the body's own centre, so every panel of a split
+   helmet gets the same layout.
+
+6. `fea.py` voxelises the part into cube elements (stiffness scaled by how
    full each one is, `E * density^2`, so a latticed part is analysed as a
    homogenised material), solves with algebraic multigrid (pyamg), and runs
    SIMP topology optimisation with a density filter and optimality-criteria
@@ -129,6 +142,11 @@ shells, volumes and relative density.
   4 voxels; use a finer pitch for thin struts.
 - The conformal map compresses cells around the circumference toward the rim
   (about 0.64x at the equator), because it flattens the dome from the crown.
+  A reference body fixes the size down each meridian, not around.
+- With a reference body, cells stretch where the shell stands far off it
+  (e.g. a back panel hanging behind the neck), and the relaxed layout has a
+  few 5- and 7-sided cells where the rows meet. The cap over an open surface
+  is a guess at the missing shape; close the surface in CAD for control.
 - With `--skin-surfaces all`, a sheet TPMS seals its two labyrinths as
   internal voids (`surface_shells` > 1). Fine for FDM; for resin or powder,
   leave the rim open or add `--hole`s.

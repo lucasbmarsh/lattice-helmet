@@ -223,3 +223,82 @@ def test_cut_edges_of_a_panel_count_as_rim():
     sheet = ~cut & ((r > 99.5) | (r < 93.5))
     assert (labels[sheet & (r > 99.5)] == "outer").mean() > 0.95  # all but a sliver next to the cuts
     assert (labels[sheet & (r < 93.5)] == "inner").mean() > 0.95
+
+
+# -- reference body (wrap="reference") ----------------------------------------
+
+def _head(radii=(70, 90, 60)):
+    """A smooth, egg-like 'head': an ellipsoid, wider front-to-back than tall."""
+    head = trimesh.creation.icosphere(4, radius=1)
+    head.apply_scale(radii)
+    return head
+
+
+def test_reference_cells_keep_their_size_on_a_long_head():
+    from lattice_helmet.fields import geodesic_points
+    from lattice_helmet.reference import Reference
+    from scipy.spatial import cKDTree
+
+    head = _head()
+    ref = Reference(head)
+    seeds = ref.hex_seeds(15, np.zeros(3), (2, 1))
+    d, _ = cKDTree(seeds).query(seeds, k=4)
+    assert np.median(d[:, 1:]) == pytest.approx(15, rel=0.06)
+    spread = d[:, 1:].std() / d[:, 1:].mean()
+    # The sphere layout pushed straight out onto the same head stretches.
+    g = geodesic_points(round(1.1071 * 72 / 15), (2, 1)) * np.array([70, 90, 60])
+    d0, _ = cKDTree(g).query(g, k=4)
+    assert spread < 0.75 * (d0[:, 1:].std() / d0[:, 1:].mean())
+
+
+def test_reference_walls_run_along_the_surface_normal():
+    from lattice_helmet.reference import Reference
+
+    ref = Reference(trimesh.creation.icosphere(4, radius=50))
+    n = np.array([0.3, 0.2, 0.93])
+    n /= np.linalg.norm(n)
+    p = np.array([r * n for r in (50, 56, 62)])
+    f = ref.hex_field(p[:, 0], p[:, 1], p[:, 2], 12, np.zeros(3), (2, 1), bounds=[[-70] * 3, [70] * 3])
+    assert np.ptp(f) < 0.3  # same distance to the walls all the way out
+
+
+def test_open_reference_gets_a_cap():
+    from lattice_helmet.reference import Reference
+
+    head = _head((70, 70, 70))
+    back = head.triangles_center[:, 1] < -40  # cut off flat at the back
+    ref = Reference(trimesh.Trimesh(head.vertices, head.faces[~back]))
+    assert ref.capped == 1
+    cap = ref.points[len(ref.points) - 1]
+    assert cap[1] < -40  # the cap closes the back, bulging outward
+
+
+def test_reference_meridians_match_a_sphere():
+    from lattice_helmet.reference import Reference
+
+    ref = Reference(trimesh.creation.icosphere(5, radius=50))
+    a = np.array([0.3, 0.8, 1.4])
+    s = ref.arc_from_crown(np.zeros(3), a, np.zeros(3), (2, 1))
+    assert s == pytest.approx(50 * a, rel=0.03)
+    s = ref.arc_from_crown(np.zeros(3), a, np.zeros(3), (2, 1), offset=10)
+    assert s == pytest.approx(60 * a, rel=0.03)
+
+
+def test_build_wrapped_around_a_reference():
+    from lattice_helmet.reference import Reference
+
+    dome = _dome()
+    head = trimesh.creation.icosphere(4, radius=40)
+    spec = dict(lattice="geodesic_hex", cell=12, wall_min=1.5, wall_max=1.5, skin=0, fillet=0, pitch=0.75, **QUIET)
+    with pytest.raises(ValueError, match="reference body"):
+        build(dome, LatticeSpec(wrap="reference", **spec))
+    b = build(dome, LatticeSpec(wrap="reference", **spec), reference=Reference(head))
+    assert b.is_watertight
+    # Cells are sized on the head (r = 40), so they come out bigger on the
+    # shell, as sphere cells sized at the shell's middle radius would be.
+    r = float(np.median(np.linalg.norm(dome.vertices, axis=1)))
+    a = build(dome, LatticeSpec(**dict(spec, cell=12 * r / 40)))
+    assert b.volume == pytest.approx(a.volume, rel=0.15)
+    c = preview(dome, LatticeSpec(wrap="reference", cell_map="conformal", lattice="honeycomb_hex", cell=8,
+                                  **QUIET), voxels=4e5, reference=Reference(head))[0]
+    assert len(c.faces) > 1000

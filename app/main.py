@@ -12,6 +12,7 @@ import html
 import json
 import os
 from pathlib import Path
+import re
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -20,7 +21,7 @@ from pydantic import BaseModel
 
 import numpy as np
 
-from lattice_helmet.build import GRADINGS, LatticeSpec, simulate
+from lattice_helmet.build import GRADINGS, WRAPS, LatticeSpec, simulate
 from lattice_helmet.fea import MATERIALS, SimSpec, TopoSpec, density_mesh
 from lattice_helmet.fields import lattice_kinds
 from lattice_helmet.maps import MAPS
@@ -31,6 +32,8 @@ from .onshape import Onshape, OnshapeError
 from .shells import ShellStore, Superseded, pack
 
 WORKDIR = Path(os.environ.get("LATTICE_WORKDIR", "jobs"))
+# A Part Studio tab's address: .../documents/<did>/<w|v|m>/<id>/e/<eid>
+ONSHAPE_URL = re.compile(r"/documents/(?P<did>[0-9a-f]{24})/(?P<wvm>[wvm])/(?P<wvmid>[0-9a-f]{24})/e/(?P<eid>[0-9a-f]{24})")
 
 
 _UNSET = object()
@@ -92,7 +95,7 @@ def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
         """What the panel's dropdowns offer, and the default recipe."""
         return {"lattices": lattice_kinds(), "cell_maps": list(MAPS),
                 "gradings": list(GRADINGS), "materials": {k: {"E": e, "nu": n} for k, (e, n) in MATERIALS.items()},
-                "skin_surfaces": ["all", "outer", "inner", "rim"],
+                "skin_surfaces": ["all", "outer", "inner", "rim"], "wraps": list(WRAPS),
                 "auth": "oauth" if oauth else "server",
                 "defaults": json.loads(LatticeSpec().to_json())}
 
@@ -121,13 +124,30 @@ def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
 
     @app.post("/api/jobs/upload")
     async def job_from_upload(file: UploadFile = File(...), recipe: str = Form("{}"),
-                              token=Depends(user_token)):
+                              reference: UploadFile = File(None), token=Depends(user_token)):
         filetype = Path(file.filename or "shell.stl").suffix.lstrip(".").lower() or "stl"
-        return _submit(await file.read(), json.loads(recipe), filetype)
+        ref = None
+        if reference is not None:
+            ref = (await reference.read(), Path(reference.filename or "ref.stl").suffix.lstrip(".").lower() or "stl")
+        return _submit(await file.read(), json.loads(recipe), filetype, reference=ref)
 
-    def _submit(data, recipe, filetype, source=None):
+    @app.get("/api/onshape/link")
+    def onshape_link(url: str, token=Depends(user_token)):
+        """The parts of the Part Studio an Onshape link (a tab's URL) points to,
+        for picking a body from another document, such as a headform."""
+        m = ONSHAPE_URL.search(url)
+        if not m:
+            raise HTTPException(422, "that doesn't look like an Onshape Part Studio link "
+                                     "(https://cad.onshape.com/documents/.../w/.../e/...)")
+        ids = {"did": m["did"], "wvm": m["wvm"], "wvmid": m["wvmid"], "eid": m["eid"]}
         try:
-            job = queue.submit(data, recipe, filetype, source)
+            return dict(ids, parts=make_client(token).list_parts(**ids))
+        except OnshapeError as e:
+            raise _onshape_failed(e)
+
+    def _submit(data, recipe, filetype, source=None, reference=None):
+        try:
+            job = queue.submit(data, recipe, filetype, source, reference)
         except (ValueError, TypeError) as e:
             raise HTTPException(422, str(e))
         return job.public()
@@ -170,6 +190,46 @@ def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
     def shell_mesh(shell_id: str):
         return Response(pack(_shell(shell_id).mesh), media_type="application/octet-stream")
 
+    # The reference body (e.g. the headform) that wrap="reference" lays the
+    # cells over, from any Part Studio or a file. It must sit where the head
+    # sits in the shell's coordinates; a surface is fine.
+
+    class ReferencePart(OnshapePart):
+        name: str = None
+
+    def _set_reference(shell, data, filetype, source=None, name=None):
+        try:
+            return shell.set_reference(data, filetype, source, name)
+        except (ValueError, IndexError) as e:
+            raise HTTPException(422, f"could not use that body: {e}")
+
+    @app.post("/api/shells/{shell_id}/reference/onshape")
+    def reference_from_onshape(shell_id: str, req: ReferencePart, token=Depends(user_token)):
+        shell = _shell(shell_id)
+        try:
+            stl = make_client(token).export_stl(req.did, req.wvm, req.wvmid, req.eid, req.part_id, closed=False)
+        except OnshapeError as e:
+            raise _onshape_failed(e)
+        return _set_reference(shell, stl, "stl", req.model_dump(exclude={"name"}), req.name)
+
+    @app.post("/api/shells/{shell_id}/reference/upload")
+    async def reference_from_upload(shell_id: str, file: UploadFile = File(...), token=Depends(user_token)):
+        shell = _shell(shell_id)
+        filetype = Path(file.filename or "ref.stl").suffix.lstrip(".").lower() or "stl"
+        return _set_reference(shell, await file.read(), filetype, name=file.filename)
+
+    @app.delete("/api/shells/{shell_id}/reference")
+    def reference_clear(shell_id: str):
+        _shell(shell_id).clear_reference()
+        return {"ok": True}
+
+    @app.get("/api/shells/{shell_id}/reference/mesh")
+    def reference_mesh(shell_id: str):
+        shell = _shell(shell_id)
+        if shell.reference is None:
+            raise HTTPException(404, "no reference body loaded")
+        return Response(pack(shell.reference.mesh), media_type="application/octet-stream")
+
     class PreviewReq(BaseModel):
         recipe: dict = {}
         detail: float = 1.0  # 1 = about 1.5 M voxels
@@ -178,6 +238,8 @@ def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
     def shell_preview(shell_id: str, req: PreviewReq, token=Depends(user_token)):
         """A coarse mesh of the lattice part, in the same packed format as /mesh."""
         shell = _shell(shell_id)
+        if req.recipe.get("wrap") == "reference" and shell.reference is None:
+            raise HTTPException(422, "load a reference body first (under Wrap cells around)")
         try:
             mesh, info = shells.preview(shell, req.recipe, min(max(req.detail, 0.25), 4.0))
         except Superseded:
@@ -194,7 +256,7 @@ def make_app(onshape_factory=Onshape, workdir=WORKDIR, oauth=_UNSET):
     def shell_build(shell_id: str, req: ShellJob, token=Depends(user_token)):
         """The full-resolution build of a loaded shell (same job flow as /api/jobs)."""
         shell = _shell(shell_id)
-        return _submit(shell.data, req.recipe, shell.filetype, shell.source)
+        return _submit(shell.data, req.recipe, shell.filetype, shell.source, shell.reference_file)
 
     # Simulation: a static analysis or a topology optimisation of a loaded
     # shell. The result lands in the shell's preview cache too, so grading

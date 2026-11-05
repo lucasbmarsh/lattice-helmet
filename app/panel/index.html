@@ -62,6 +62,28 @@
     <option value="auto">auto</option><option>+x</option><option>-x</option><option>+y</option><option>-y</option><option>+z</option><option>-z</option></select></label>
 </fieldset>
 
+<fieldset id="ref-box">
+  <legend>Wrap cells around</legend>
+  <label>Lay cells over <select id="wrap" title="what the hex and conformal lattices are laid out on">
+    <option value="sphere">a sphere fit</option><option value="reference">a reference body</option></select></label>
+  <div id="ref-rows" class="hidden">
+    <p class="hint">Pick the body the helmet was built around, such as the headform. Cells are spread
+      evenly over it (cell size is measured on it) and their holes follow its surface out through the
+      shell. Used by geodesic_hex and the conformal cell map. It must sit where the head sits in this
+      part's coordinates; a surface is fine.</p>
+    <label>Body from <select id="ref-src"><option value="part">this Part Studio</option>
+      <option value="link">another Onshape tab</option><option value="file">a mesh file</option></select></label>
+    <label id="ref-part-row">Part <select id="ref-part"></select></label>
+    <div id="ref-link-row" class="hidden">
+      <label>Tab link <input id="ref-link" placeholder="paste the headform tab's address"></label>
+      <label>Part <select id="ref-link-part"></select></label>
+    </div>
+    <label id="ref-file-row" class="hidden">Mesh file <input id="ref-file" type="file" accept=".stl,.obj,.3mf,.ply"></label>
+    <div class="row"><button id="ref-load" class="secondary">Use this body</button><button id="ref-clear" class="secondary" disabled>Remove</button></div>
+    <p id="ref-info" class="hint"></p>
+  </div>
+</fieldset>
+
 <fieldset>
   <legend>Lattice</legend>
   <label>Type <select id="lattice"></select></label>
@@ -119,6 +141,7 @@
     <div class="checks">
       <label><input id="live" type="checkbox" checked>Live preview</label>
       <label><input id="ghost" type="checkbox" checked>Show shell</label>
+      <label id="show-ref-row" class="hidden"><input id="show-ref" type="checkbox" checked>Show reference</label>
       <label><input id="show-zones" type="checkbox" checked>Show zones</label>
       <label id="result-row" class="hidden">View <select id="result-view"><option value="lattice">lattice preview</option><option value="displacement">displacement</option><option value="stress">stress</option></select></label>
       <label>Detail <select id="detail"><option value="0.5">coarse</option><option value="1" selected>normal</option><option value="3">fine</option></select></label>
@@ -231,15 +254,117 @@ async function init() {
     if (tokens || authMode !== "oauth") await loadParts();
   } else {
     $("part-row").classList.add("hidden"); $("file-row").classList.remove("hidden");
+    $("ref-src").value = "file"; $("ref-src").querySelector('[value="part"]').disabled = true; showRefSource();
     say("Not opened from Onshape: upload a shell mesh instead.");
   }
 }
+
+// ---- reference body ----------------------------------------------------------
+// The body (usually the headform) that the hex and conformal lattices are laid
+// over instead of a sphere. `refLoaded` remembers what was picked, so it can be
+// sent again when the part changes or the service restarts.
+
+let refLoaded = null, refLink = null;
+
+function showRefSource() {
+  const src = $("ref-src").value;
+  $("ref-part-row").classList.toggle("hidden", src !== "part");
+  $("ref-link-row").classList.toggle("hidden", src !== "link");
+  $("ref-file-row").classList.toggle("hidden", src !== "file");
+}
+$("ref-src").onchange = showRefSource;
+
+$("wrap").onchange = () => {
+  const on = $("wrap").value === "reference";
+  $("ref-rows").classList.toggle("hidden", !on);
+  $("show-ref-row").classList.toggle("hidden", !on || !refLoaded);
+  groups.ref.visible = on && $("show-ref").checked;
+  if (on && !refLoaded) viewMsg("Pick a reference body and press Use this body.");
+};
+
+$("ref-link").onchange = async () => {
+  refLink = null; $("ref-link-part").innerHTML = "";
+  const url = $("ref-link").value.trim();
+  if (!url) return;
+  showRefInfo("Reading that tab…");
+  try {
+    refLink = await api(`/api/onshape/link?url=${encodeURIComponent(url)}`);
+    $("ref-link-part").innerHTML = refLink.parts.map(p => `<option value="${esc(p.partId)}">${esc(p.name)}</option>`).join("");
+    showRefInfo(refLink.parts.length ? "Pick the body, then press Use this body." : "That tab has no parts or surfaces.", refLink.parts.length ? "" : "bad");
+  } catch (e) { showRefInfo(e.message, "bad"); }
+};
+
+function showRefInfo(text, cls) { $("ref-info").textContent = text || ""; $("ref-info").className = "hint " + (cls || ""); }
+
+// What the panel's controls pick right now, as something loadReference can send.
+function refChoice() {
+  const src = $("ref-src").value;
+  if (src === "part") {
+    const o = $("ref-part").selectedOptions[0];
+    if (!o) throw new Error("this Part Studio has no parts to pick");
+    return { src, body: { ...doc, part_id: o.value, name: o.textContent } };
+  }
+  if (src === "link") {
+    const o = $("ref-link-part").selectedOptions[0];
+    if (!refLink || !o) throw new Error("paste the headform tab's address first");
+    const { parts, ...ids } = refLink;
+    return { src, body: { ...ids, part_id: o.value, name: o.textContent } };
+  }
+  const f = $("ref-file").files[0];
+  if (!f) throw new Error("choose a mesh file first");
+  return { src, file: f };
+}
+
+async function loadReference() {
+  if (!shellId || !refLoaded) return;
+  $("ref-load").disabled = true;
+  showRefInfo("Loading the reference body…"); viewMsg("Loading the reference body…");
+  try {
+    let info;
+    if (refLoaded.file) {
+      const body = new FormData(); body.append("file", refLoaded.file);
+      info = await api(`/api/shells/${shellId}/reference/upload`, { method: "POST", body });
+    } else {
+      info = await api(`/api/shells/${shellId}/reference/onshape`, { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(refLoaded.body) });
+    }
+    const buf = await (await api(`/api/shells/${shellId}/reference/mesh`, { raw: true })).arrayBuffer();
+    setGroup(groups.ref, unpack(buf), [mats.ref]);
+    groups.ref.visible = $("show-ref").checked;
+    $("show-ref-row").classList.remove("hidden"); $("ref-clear").disabled = false;
+    showRefInfo(`Using ${info.name || "the reference body"}: about ${info.gap_mm} mm inside the shell` +
+      (info.capped ? `, open in ${info.capped} place${info.capped > 1 ? "s" : ""}, closed with a rounded cap there.` : "."), "ok");
+    viewMsg("");
+    schedulePreview(0);
+  } catch (e) {
+    refLoaded = null; setGroup(groups.ref, null, []); $("show-ref-row").classList.add("hidden");
+    showRefInfo(e.message, "bad"); viewMsg("");
+  }
+  $("ref-load").disabled = false;
+}
+
+$("ref-load").onclick = () => {
+  if (!shellId) { showRefInfo("Load the shell part first.", "bad"); return; }
+  try { refLoaded = refChoice(); } catch (e) { showRefInfo(e.message, "bad"); return; }
+  loadReference();
+};
+$("ref-clear").onclick = async () => {
+  refLoaded = null; setGroup(groups.ref, null, []);
+  $("show-ref-row").classList.add("hidden"); $("ref-clear").disabled = true; showRefInfo("");
+  if (shellId) await api(`/api/shells/${shellId}/reference`, { method: "DELETE" }).catch(() => {});
+  if ($("wrap").value === "reference") { $("wrap").value = "sphere"; $("wrap").onchange(); schedulePreview(0); }
+};
+$("show-ref").onchange = () => { groups.ref.visible = $("show-ref").checked; };
 
 async function loadParts() {
   if (!inOnshape) return;
   try {
     const parts = await api(`/api/parts?did=${doc.did}&wvm=${doc.wvm}&wvmid=${doc.wvmid}&eid=${doc.eid}`);
     $("part").innerHTML = parts.map(p => `<option value="${esc(p.partId)}">${esc(p.name)}</option>`).join("");
+    $("ref-part").innerHTML = $("part").innerHTML;
+    // A part or surface named like a headform is the likely reference.
+    const head = parts.find(p => /head|form|dummy/i.test(p.name));
+    if (head) $("ref-part").value = head.partId;
     if (!parts.length) { say("This Part Studio has no parts.", "bad"); return; }
   } catch (e) { say((e instanceof SignInNeeded ? "" : "Could not list parts: ") + e.message, "bad"); return; }
   await loadShell();
@@ -355,6 +480,7 @@ function recipe() {
   if (r.lattice.startsWith("voronoi")) r.seed = parseInt($("seed").value) || 0;
   r.regions = zones.map(z => z.get());
   r.up = $("up").value;
+  r.wrap = $("wrap").value;
   if (SIM_GRADINGS.includes(r.grading)) { r.simulation = simulation(); if (r.grading === "topopt") r.topopt = topoSettings(); }
   return r;
 }
@@ -434,14 +560,16 @@ const mats = {
   ghost: new THREE.MeshStandardMaterial({ color: 0x8aa0c0, transparent: true, opacity: 0.15, depthWrite: false,
                                           side: THREE.DoubleSide, clippingPlanes: clip }),
 };
-const groups = { shell: new THREE.Group(), part: new THREE.Group(), zones: new THREE.Group() };
-scene.add(groups.shell, groups.part, groups.zones);
+const groups = { shell: new THREE.Group(), part: new THREE.Group(), zones: new THREE.Group(), ref: new THREE.Group() };
+scene.add(groups.shell, groups.part, groups.zones, groups.ref);
 mats.zone = new THREE.MeshBasicMaterial({ color: 0xff8a2a, transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide });
 mats.zoneEdge = new THREE.LineBasicMaterial({ color: 0xff8a2a });
 mats.fixed = new THREE.MeshBasicMaterial({ color: 0x3a7bff, transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide });
 mats.fixedEdge = new THREE.LineBasicMaterial({ color: 0x3a7bff });
 mats.load = new THREE.MeshBasicMaterial({ color: 0xe0335a, transparent: true, opacity: 0.2, depthWrite: false, side: THREE.DoubleSide });
 mats.loadEdge = new THREE.LineBasicMaterial({ color: 0xe0335a });
+mats.ref = new THREE.MeshStandardMaterial({ color: 0x3fae6a, transparent: true, opacity: 0.35, depthWrite: false,
+                                         side: THREE.DoubleSide, clippingPlanes: clip });
 mats.result = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.6, metalness: 0, clippingPlanes: clip });
 
 function unpack(buf, withValues = false) {
@@ -510,7 +638,7 @@ renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, came
 async function loadShell() {
   shellId = null; jobId = null; simJob = null;
   $("result-row").classList.add("hidden"); $("result-view").value = "lattice"; $("legend").classList.add("hidden");
-  setGroup(groups.part, null, []); setGroup(groups.shell, null, []);
+  setGroup(groups.part, null, []); setGroup(groups.shell, null, []); setGroup(groups.ref, null, []);
   $("download").disabled = $("import").disabled = true;
   viewMsg(inOnshape ? "Loading the part from Onshape…" : "Loading the mesh…");
   try {
@@ -533,6 +661,9 @@ async function loadShell() {
     const size = shellBounds[1].map((v, i) => Math.round(v - shellBounds[0][i])).join(" × ");
     $("view-info").textContent = `${size} mm` + (s.watertight ? "" : " · not watertight, the lattice may leak");
     viewMsg("");
+    // A new part (or a restarted service) has no reference body yet: send the one in use again.
+    if (refLoaded) { await loadReference(); return; }
+    showRefInfo(null);
     schedulePreview(0);
   } catch (e) { viewMsg("Could not load the part: " + e.message); }
 }
@@ -548,6 +679,7 @@ function schedulePreview(delay = 350) {
 
 async function runPreview() {
   if (!shellId) return;
+  if ($("wrap").value === "reference" && !refLoaded) { viewMsg("Pick a reference body and press Use this body."); return; }
   previewAbort?.abort();
   const ctl = previewAbort = new AbortController(), id = shellId;
   viewMsg("Updating preview…");
@@ -693,6 +825,7 @@ $("sim-import").onclick = async () => {
 // Any settings change re-runs the preview.
 for (const ev of ["input", "change"]) $("form-col").addEventListener(ev, e => {
   if (e.target.closest("#source")) return;  // a new part reloads the shell instead
+  if (e.target.closest("#ref-box") && e.target.id !== "wrap") return;  // "Use this body" previews
   if (e.target.closest("#sim-box")) { drawZones(); if (!SIM_GRADINGS.includes($("grading").value)) return; }
   if ($("result-view").value !== "lattice") { $("result-view").value = "lattice"; $("legend").classList.add("hidden"); }
   if (ev === "input" && e.target.type === "number" && !e.target.validity.valid) return;

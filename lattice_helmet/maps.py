@@ -35,12 +35,16 @@ def _whole(length, cell):
     return max(1, int(round(length / cell)))
 
 
-def map_coords(kind, x, y, z, cell, center, ref_radius, pole=None, shell_t=None, layers=1):
+def map_coords(kind, x, y, z, cell, center, ref_radius, pole=None, shell_t=None, layers=1, arc=None):
     """Return (u, v, w) in mm of lattice space.
 
     ref_radius  typical radius of the shell's mid-surface (sets cell count around)
     shell_t     0 at the outer surface, 1 at the inner surface (conformal only)
     layers      whole number of cells through the shell (conformal only)
+    arc         conformal only: arc(theta, alpha) gives the distance (mm) from
+                the crown along a reference surface, for azimuth theta and
+                angle alpha from the crown axis; default ref_radius * alpha,
+                the distance on a sphere
     """
     x, y, z = np.broadcast_arrays(x, y, z)
     if kind == "rectangular":
@@ -63,6 +67,7 @@ def map_coords(kind, x, y, z, cell, center, ref_radius, pole=None, shell_t=None,
         a, b, h = _frame(x, y, z, center, pole or "z")
         rho = np.sqrt(a * a + b * b)
         alpha = np.arctan2(rho, h)  # angle from the crown
-        k = np.float32(ref_radius) * alpha / np.maximum(rho, 1e-6)
+        dist = np.float32(ref_radius) * alpha if arc is None else arc(np.arctan2(b, a), alpha)
+        k = dist / np.maximum(rho, 1e-6)
         return a * k, b * k, shell_t * np.float32(layers * cell)
     raise ValueError(f"unknown cell map {kind!r}; choose from {MAPS}")
